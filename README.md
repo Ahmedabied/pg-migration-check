@@ -57,9 +57,13 @@ with the table: a 50M row table is roughly 50 times these numbers.
 
 ```sh
 git clone https://github.com/Ahmedabied/pg-migration-check && cd pg-migration-check
-python3 -m venv .venv && . .venv/bin/activate && pip install -e '.[local]'   # local adds a throwaway Postgres
+python3.12 -m venv .venv && . .venv/bin/activate && pip install -e '.[local]'   # local adds a throwaway Postgres
 python bench/bench.py --rows 100000
 ```
+
+That took 4 seconds from a fresh clone (pip cache warm). The throwaway Postgres comes from
+[pgserver](https://github.com/orm011/pgserver), which has wheels for Python 3.9 to 3.12; the checker itself runs on
+3.10 and newer, and needs no local Postgres when you give it `--dsn`.
 
 Against your own scratch database:
 
