@@ -85,6 +85,9 @@ CHECK its values break, a unique boolean) is reported and skipped, never half fi
 `--rows-from DSN` takes each table's count from another database's statistics instead (`pg_class.reltuples`,
 what the planner already keeps), in a read-only session that scans no table: point it at production and the scratch
 tables get production's row counts. Tables never analyzed there have no estimate and are left empty.
+Give it a login role with no privileges at all (`CREATE ROLE stats LOGIN PASSWORD '...'`): every role can read
+`pg_class`, so it sees the counts but cannot read a single row of your tables (tested). The session is read only
+either way, but the credential sits in your CI, so make it one that cannot do harm.
 
 ## In a Django project
 
@@ -147,6 +150,9 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
   the classic outage, and the reason for `lock_timeout`, which it checks for.
 - **One statement per transaction.** Django wraps a migration in one transaction; the summary line adds up how long
   each table stays locked in that case.
+- **`--rows` picks tables by name.** A table is filled when its name appears as a word anywhere in the migration's
+  SQL, so a table called like a common column (`name`, `email`) can be filled without being touched. Harmless, but
+  at a million rows it costs seconds; `--rows that_table=0` turns it off.
 - **SQL files and Django.** Django has its own command (above); other frameworks need their SQL output. In Django,
   data migrations (`RunPython`) are not run on the scratch database, so a later migration that needs their data fails
   there.
@@ -155,7 +161,7 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 27 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 28 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.

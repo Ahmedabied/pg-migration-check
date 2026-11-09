@@ -143,3 +143,17 @@ def test_cli_rows_from(dsn, tmp_path):
     r = subprocess.run([sys.executable, "-m", "pg_migration_check", "--dsn", dsn, "--rows-from", dsn, str(f)],
                        capture_output=True, text=True)
     assert "not filled public.src: already has rows" in r.stdout, r.stdout + r.stderr
+
+
+def test_a_partitioned_table_counts_the_rows_of_its_partitions(dsn):
+    from pg_migration_check.seed import counts_from
+
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("create table event (id int, at date) partition by range (at)")
+        c.execute("create table event_2025 partition of event for values from ('2025-01-01') to ('2026-01-01')")
+        c.execute("create table event_2026 partition of event for values from ('2026-01-01') to ('2027-01-01')")
+        c.execute("insert into event select g, date '2025-01-01' + (g % 700) from generate_series(1, 7000) g")
+        c.execute("analyze event")
+    sizes = counts_from(dsn)
+    assert sizes["public.event"] == 7000  # the parent, by the sum of its leaves
+    assert "public.event_2025" not in sizes  # partitions are filled through their parent, not counted twice
