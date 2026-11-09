@@ -131,6 +131,49 @@ def text_rules(sql: str) -> list[Finding]:
     return f
 
 
+# A table or index name as written: maybe schema-qualified, maybe quoted.
+NAME = r'((?:"[^"]+"|[\w$]+)(?:\s*\.\s*(?:"[^"]+"|[\w$]+))?)'
+
+
+def is_concurrent(stmt: str) -> bool:
+    """True for the statements CONCURRENTLY keeps out of a transaction block, told by their shape: the word in a
+    column name or a string does not count, and REFRESH MATERIALIZED VIEW CONCURRENTLY runs in a transaction."""
+    s = _norm(stmt)
+    return bool(re.match(r"CREATE (UNIQUE )?INDEX CONCURRENTLY\b|DROP INDEX CONCURRENTLY\b"
+                         r"|REINDEX (\([^)]*\) )?(INDEX|TABLE|SCHEMA|DATABASE|SYSTEM) CONCURRENTLY\b"
+                         r"|REINDEX \( ?([^)]*, ?)?CONCURRENTLY( TRUE| ON| 1)? ?(,[^)]*)?\)", s)
+                or re.match(r"ALTER TABLE .* DETACH PARTITION .* CONCURRENTLY$", s))
+
+
+def _table_of(conn, name: str, index: bool) -> str:
+    """schema.table for a name as written (for an index: the table it is on), read before the statement runs."""
+    q = ("select n.nspname || '.' || t.relname from pg_class t join pg_namespace n on n.oid = t.relnamespace "
+         + ("join pg_index i on i.indrelid = t.oid where i.indexrelid = to_regclass(%s)" if index
+            else "where t.oid = to_regclass(%s)"))
+    try:
+        row = conn.execute(q, (name,)).fetchone()
+    except Exception:
+        row = None
+    return row[0] if row else re.sub(r'\s|"', "", name)
+
+
+def concurrent_locks(conn, stmt: str) -> dict[str, str]:
+    """The table locks a CONCURRENTLY statement takes, from the Postgres docs: they are gone by the time it returns."""
+    sue = "ShareUpdateExclusiveLock"
+    m = re.match(r"\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?" + NAME + r"\s+DETACH\s+PARTITION\s+" + NAME, stmt, re.I)
+    if m:  # the partition gets ACCESS EXCLUSIVE in the second of its two transactions
+        return {_table_of(conn, m.group(1), False): sue, _table_of(conn, m.group(2), False): "AccessExclusiveLock"}
+    m = re.search(r"\bON\s+(?:ONLY\s+)?" + NAME, stmt, re.I)
+    if re.match(r"\s*CREATE\s", stmt, re.I) and m:
+        return {_table_of(conn, m.group(1), False): sue}
+    m = re.match(r"\s*(?:DROP\s+INDEX|REINDEX\s*(?:\([^)]*\)\s*)?(INDEX|TABLE|SCHEMA|DATABASE|SYSTEM))"
+                 r"(?:\s+CONCURRENTLY)?(?:\s+IF\s+EXISTS)?\s+" + NAME, stmt, re.I)
+    if m:
+        kind = (m.group(1) or "INDEX").upper()
+        return {_table_of(conn, m.group(2), kind == "INDEX") if kind in ("INDEX", "TABLE") else m.group(2): sue}
+    return {"?": sue}
+
+
 def _has_valid_not_null_check(conn, stmt: str) -> bool:
     """Postgres 12+ skips the SET NOT NULL scan when a validated CHECK (col IS NOT NULL) exists."""
     m = re.match(r'\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?("?[\w.]+"?)\s+ALTER\s+(?:COLUMN\s+)?("?\w+"?)\s+SET\s+NOT\s+NULL',
@@ -165,14 +208,14 @@ def check(conn, sql: str, slow_ms: float = 1000.0) -> list[Result]:
             conn.execute(stmt)
             results.append(r)
             continue
-        r.concurrently = "CONCURRENTLY" in s
+        r.concurrently = is_concurrent(stmt)
         try:
-            if r.concurrently:  # cannot run in a transaction block; takes SHARE UPDATE EXCLUSIVE
+            if r.concurrently:  # cannot run in a transaction block; its locks are released before we could read them
+                locks = concurrent_locks(conn, stmt)
                 t = time.perf_counter()
                 conn.execute(stmt)
                 r.ms = (time.perf_counter() - t) * 1000
-                m = re.search(r"\bON\s+(ONLY\s+)?([\w.\"]+)", stmt, re.I) or re.search(r"INDEX\s+CONCURRENTLY\s+(IF\s+EXISTS\s+)?([\w.\"]+)", stmt, re.I)
-                r.locks = {m.group(2).strip('"') if m else "?": "ShareUpdateExclusiveLock"}
+                r.locks = locks
             else:
                 with conn.transaction():
                     before = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}

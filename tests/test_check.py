@@ -48,10 +48,33 @@ def test_index_without_concurrently_blocks_writes(conn):
 def test_concurrent_index_runs_outside_a_transaction(conn):
     res = check(conn, "create index concurrently orders_email on orders (email)")
     (r,) = [x for x in res if x.n]
-    assert r.error is None and r.concurrently and r.locks == {"orders": "ShareUpdateExclusiveLock"}
+    assert r.error is None and r.concurrently and r.locks == {"public.orders": "ShareUpdateExclusiveLock"}
     assert not any(f.level != "info" for f in r.findings)
     assert held_until_commit(res) == {}
     assert conn.execute("select count(*) from pg_indexes where indexname = 'orders_email'").fetchone()[0] == 1
+
+
+def test_drop_index_concurrently_names_the_table_not_the_index(conn):
+    conn.execute("create index orders_qty on orders (qty)")
+    (r,) = [x for x in check(conn, 'DROP INDEX CONCURRENTLY IF EXISTS "public"."orders_qty"') if x.n]
+    assert r.error is None and r.concurrently and r.locks == {"public.orders": "ShareUpdateExclusiveLock"}
+
+
+def test_the_word_concurrently_elsewhere_does_not_hide_a_rewrite(conn):
+    # Only the statement's shape says CONCURRENTLY; a column name or a string that contains the word does not.
+    (r,) = [x for x in check(conn, "alter table orders add column last_run_concurrently timestamptz "
+                                   "default clock_timestamp()") if x.n]
+    assert not r.concurrently
+    assert r.rewritten == ["public.orders"] and r.locks["public.orders"] == "AccessExclusiveLock"
+    assert "danger" in levels(r)
+
+
+def test_refresh_materialized_view_concurrently_runs_in_a_transaction_and_blocks_writes(conn):
+    conn.execute("create materialized view order_qty as select qty, count(*) n from orders group by qty")
+    conn.execute("create unique index on order_qty (qty)")
+    (r,) = [x for x in check(conn, "refresh materialized view concurrently order_qty") if x.n]
+    assert r.error is None and not r.concurrently
+    assert r.locks["public.order_qty"] == "ExclusiveLock" and r.locks["public.orders"] == "AccessShareLock"
 
 
 def test_foreign_key_locks_both_tables_and_not_valid_is_the_fix(conn):
@@ -124,3 +147,16 @@ def test_set_not_null_after_a_validated_check_is_not_flagged(conn):
     assert last.error is None and not [f for f in last.findings if f.level != "info"]
     plain = [x for x in check(conn, "set lock_timeout = '2s'; alter table orders alter column qty set not null") if x.n == 2][0]
     assert any(f.text.startswith("SET NOT NULL") for f in plain.findings)
+
+
+def test_concurrent_shapes():
+    from pg_migration_check.check import is_concurrent
+
+    yes = ["create unique index concurrently if not exists i on t (a)", "DROP INDEX CONCURRENTLY i",
+           "reindex (verbose) index concurrently i", "reindex table concurrently t", "reindex (concurrently) table t",
+           "reindex (verbose, concurrently true) table t", "alter table m detach partition m_2020 concurrently"]
+    no = ["refresh materialized view concurrently mv", "reindex (concurrently false) table t",
+          "alter table t add column concurrently_seen bool", "update t set note = 'built concurrently'",
+          "create index i on t (concurrently)", "alter table m detach partition m_2020 finalize"]
+    assert [s for s in yes if not is_concurrent(s)] == []
+    assert [s for s in no if is_concurrent(s)] == []

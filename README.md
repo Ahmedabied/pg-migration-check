@@ -162,7 +162,7 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 28 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 32 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.
