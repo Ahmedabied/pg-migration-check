@@ -29,7 +29,7 @@ def project(server_uri):
                                    "HOST": info.get("host", ""), "PORT": info.get("port", "")}},
             DEFAULT_AUTO_FIELD="django.db.models.BigAutoField", USE_TZ=True)
         django.setup()
-    yield
+    yield psycopg.conninfo.make_conninfo(server_uri, dbname=name)
     from django.db import connections
     connections.close_all()
     with psycopg.connect(server_uri, autocommit=True) as c:
@@ -85,3 +85,54 @@ def test_rows_fill_the_tables_before_the_unapplied_migrations(project, dsn):
     assert "filled public.shop_order with 30,000 rows" in out[filled:].split("\n\n")[0]
     assert "on public.shop_order (30,000 rows)" in out[filled:].split("shop.0003_note")[0]
     assert code == 1
+
+
+def copy_state(c) -> tuple:
+    q = lambda sql: tuple(c.execute(sql).fetchall())
+    return (q("select table_name, column_name, data_type from information_schema.columns "
+              "where table_schema = 'public' order by 1, 2"),
+            q("select indexdef from pg_indexes where schemaname = 'public' order by 1"),
+            q("select relname, relfilenode from pg_class where relnamespace = 'public'::regnamespace order by 1"),
+            q("select app, name from django_migrations order by 1, 2"),
+            q("select count(*), md5(string_agg(o::text, ',' order by id)) from shop_order o"))
+
+
+def test_rollback_checks_a_copy_of_production_and_leaves_it_as_it_was(project, server_uri):
+    from django.core.management import call_command
+    from django.db import connections
+
+    call_command("migrate", "shop", "0001", verbosity=0)
+    call_command("migrate", "auth", verbosity=0)
+    with psycopg.connect(project, autocommit=True) as c:
+        c.execute("insert into shop_order (email, qty) select 'u' || g || '@example.com', g from generate_series(1, 30000) g")
+        c.execute("analyze shop_order")
+    connections.close_all()  # a template database must have no one connected
+    name = "copy_" + uuid.uuid4().hex[:8]
+    with psycopg.connect(server_uri, autocommit=True) as c:
+        c.execute(f"create database {name} template {psycopg.conninfo.conninfo_to_dict(project)['dbname']}")
+    copy = psycopg.conninfo.make_conninfo(server_uri, dbname=name)
+    try:
+        call_command("migrate", "shop", verbosity=0)  # the project database is ahead: only the copy decides
+        with psycopg.connect(copy, autocommit=True) as c:
+            before = copy_state(c)
+        code, out = run("--rollback", "--dsn", copy)
+        assert code == 1, out
+        assert "shop.0002_widen_qty_and_index" in out and "shop.0003_note" in out and "shop.0001_initial" not in out
+        assert "rewrites public.shop_order" in out and "public.shop_order (30,000 rows)" in out
+        assert "2 migrations checked (not yet applied to the copy). Rolled back" in out
+        with psycopg.connect(copy, autocommit=True) as c:
+            assert copy_state(c) == before
+    finally:
+        with psycopg.connect(server_uri, autocommit=True) as c:
+            c.execute(f"drop database {name} with (force)")
+        with psycopg.connect(project, autocommit=True) as c:
+            c.execute("truncate shop_order")
+
+
+def test_rollback_needs_a_migrated_copy_and_does_not_fill_tables(project, dsn):
+    from django.core.management.base import CommandError
+
+    with pytest.raises(CommandError, match="no django_migrations table"):
+        run("--rollback", "--dsn", dsn)
+    with pytest.raises(CommandError, match="do not apply"):
+        run("--rollback", "--rows", "10", "--dsn", dsn)

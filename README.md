@@ -151,6 +151,16 @@ then `shop.0002` (an int to bigint `AlterField` and an `AddIndex`) shows what an
 
 Run with `python manage.py check_migrations --rows 1000000 --dsn ...`. 3.8 s from start to report.
 
+**`--rollback` on a copy of production.** `python manage.py check_migrations --rollback --dsn
+postgresql://.../staging_copy`: the copy's own `django_migrations` table says what is pending (not the `default`
+database), the pending migrations run on its real rows in one transaction, and it is rolled back. The test app on a
+copy with `shop.0001` applied and 1M rows in `shop_order` (Postgres 16.2): `shop.0002` rewrote the table under
+ACCESS EXCLUSIVE for 453 to 460 ms and kept it locked 1,657 to 1,673 ms until the migration commits, 1.7 s for the
+whole command, and the copy's files, rows and `django_migrations` were unchanged afterwards (two runs). The rules
+of the command line `--rollback` above apply, and one more: the pending migrations share that one transaction, so a
+later migration on a table an earlier one locked shows only the locks it adds (rewrites and the SQL rules are still
+reported).
+
 ## In GitHub Actions
 
 ```yaml
@@ -187,7 +197,7 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 50 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 52 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.
