@@ -160,3 +160,8 @@ def test_concurrent_shapes():
           "create index i on t (concurrently)", "alter table m detach partition m_2020 finalize"]
     assert [s for s in yes if not is_concurrent(s)] == []
     assert [s for s in no if is_concurrent(s)] == []
+
+
+def test_split_knows_escape_strings_and_dollar_tags_with_digits():
+    out = split("select E'it\\'s; fine'; select e'\\\\'; select $f1$ a; b $f1$; select 'a''b;c'")
+    assert out == ["select E'it\\'s; fine'", "select e'\\\\'", "select $f1$ a; b $f1$", "select 'a''b;c'"]

@@ -75,8 +75,13 @@ def split(sql: str) -> list[str]:
             buf.append(" ")
             continue
         if c in ("'", '"'):
+            # E'...' takes backslash escapes (E'\'' is one quote); other strings only double the quote
+            escapes = c == "'" and i > 0 and sql[i - 1] in "Ee" and (i < 2 or not (sql[i - 2].isalnum() or sql[i - 2] == "_"))
             j = i + 1
             while j < n:
+                if escapes and sql[j] == "\\":
+                    j += 2
+                    continue
                 if sql[j] == c and (j + 1 >= n or sql[j + 1] != c):
                     break
                 j += 2 if sql[j] == c else 1
@@ -84,7 +89,7 @@ def split(sql: str) -> list[str]:
             i = j + 1
             continue
         if c == "$":
-            m = re.match(r"\$[A-Za-z_]*\$", sql[i:])
+            m = re.match(r"\$([A-Za-z_][A-Za-z_0-9]*)?\$", sql[i:])
             if m:
                 tag = m.group(0)
                 j = sql.find(tag, i + len(tag))
@@ -213,6 +218,13 @@ ENDS_TRANSACTION = re.compile(r"(ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE TRANSA
 WRAPPER = re.compile(r"(BEGIN|COMMIT|START TRANSACTION|END)(\s+\w+)*")
 
 
+def _execute(conn, stmt: str) -> None:
+    """Send one migration statement over the extended protocol, which refuses a string holding two commands, so a
+    statement split() got wrong cannot carry a second one (a ROLLBACK under --rollback) past the checks. Asking for
+    binary results is what selects that protocol: the simple one cannot return them."""
+    conn.execute(stmt, prepare=False, binary=True)
+
+
 def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> list[Result]:
     """Apply `sql` to the database behind `conn` (a psycopg connection to a scratch database), one statement per
     transaction, and return what each statement did. Stops at the first error, like a migration would.
@@ -237,16 +249,15 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
         m = re.match(r'ALTER TABLE (?:ONLY )?(?:IF EXISTS )?("?[\w.]+"?) ALTER (?:COLUMN )?("?\w+"?) SET NOT NULL$', s)
         if m and _has_valid_not_null_check(conn, stmt):
             r.findings = [f for f in r.findings if not f.text.startswith("SET NOT NULL")]
-        if re.match(r"SET\s+(LOCAL\s+)?(LOCK_TIMEOUT|STATEMENT_TIMEOUT)\b", s):
-            conn.execute(stmt)
-            results.append(r)
-            continue
         r.concurrently = is_concurrent(stmt)
         try:
-            if r.concurrently and not rollback:  # cannot run in a transaction block; its locks are gone when it returns
+            if re.match(r"SET\s+(LOCAL\s+)?(LOCK_TIMEOUT|STATEMENT_TIMEOUT)\b", s):
+                with conn.transaction():  # a plain SET outlives its transaction (or savepoint) and lasts the session
+                    _execute(conn, stmt)
+            elif r.concurrently and not rollback:  # cannot run in a transaction block; its locks are gone when it returns
                 locks = concurrent_locks(conn, stmt)
                 t = time.perf_counter()
-                conn.execute(stmt)
+                _execute(conn, stmt)
                 r.ms = (time.perf_counter() - t) * 1000
                 r.locks = locks
             else:
@@ -255,7 +266,7 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
                     held_before = set(conn.execute(MY_LOCKS).fetchall())
                     before = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
                     t = time.perf_counter()
-                    conn.execute(plain(stmt) if r.concurrently else stmt)
+                    _execute(conn, plain(stmt) if r.concurrently else stmt)
                     r.ms = (time.perf_counter() - t) * 1000
                     held_all = conn.execute(MY_LOCKS).fetchall()
                     after = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
@@ -280,14 +291,14 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
                     r.findings.append(Finding("note", "timed without CONCURRENTLY inside the rollback transaction; "
                         "the real statement blocks no reads or writes, and a CONCURRENTLY index build reads the table "
                         "twice, so expect it to take longer"))
-            if rollback and conn.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
-                raise TransactionEnded(f"statement {n} ended the rollback transaction; the database may have been changed")
         except Exception as e:  # report and stop, as the migration would
             r.error = f"{type(e).__name__}: {str(e).strip().splitlines()[0]}"
             results.append(r)
-            if isinstance(e, TransactionEnded):
-                raise
             break
+        finally:  # checked on success and on error: an error can be what ended it
+            if rollback and conn.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
+                raise TransactionEnded(f"statement {n} ended the run's transaction, so what ran after it was not rolled "
+                                       f"back: check the database ({stmt[:60]!r})")
         existing = {t for t in r.locks if t in r.rows}
         for t, mode in r.locks.items():
             rank, label, blocks = LOCKS.get(mode, (0, mode, "?"))

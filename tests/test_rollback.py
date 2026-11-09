@@ -141,3 +141,50 @@ def test_a_lookup_that_finds_nothing_does_not_end_the_rollback_transaction(conn)
     with conn.transaction(force_rollback=True):
         res = [x for x in check(conn, sql, rollback=True) if x.n]
     assert [x.error for x in res] == [None, None, None]
+
+
+def test_an_escape_string_cannot_hide_a_rollback(conn, dsn, tmp_path):
+    # E'\'' is one quote character in Postgres; a splitter that only knows '' would read on to the next quote and
+    # send "rollback; alter table ..." to the server as part of one statement.
+    before = state(conn)
+    f = tmp_path / "x.sql"
+    f.write_text("select E'\\''; rollback; alter table orders add column hacked int; select 'x'")
+    r = run(dsn, str(f), "--rollback")
+    assert r.returncode == 2 and "ends or splits its transaction" in r.stderr
+    assert state(conn) == before
+
+
+def test_one_statement_per_round_trip_even_if_the_splitter_is_wrong(conn, monkeypatch):
+    # Second line of defence: statements go over the extended protocol, which refuses a string with two commands.
+    import pg_migration_check.check as chk
+
+    before = state(conn)
+    monkeypatch.setattr(chk, "split", lambda sql: [sql])
+    sql = "alter table orders add column a int; rollback; alter table orders add column hacked int"
+    with conn.transaction(force_rollback=True):
+        (r,) = [x for x in chk.check(conn, sql, rollback=True) if x.n]
+    assert r.error and "multiple commands" in r.error
+    assert state(conn) == before
+
+
+def test_the_run_never_says_rolled_back_when_the_transaction_ended_early(conn, dsn, tmp_path, monkeypatch, capsys):
+    # Third line of defence, tested by taking the first two away: whatever ends the transaction, the run stops
+    # and says so, and does not print "Rolled back".
+    import pg_migration_check.check as chk
+    from pg_migration_check import cli
+
+    monkeypatch.setattr(chk, "split", lambda sql: [sql])
+    monkeypatch.setattr(chk, "_execute", lambda c, stmt: c.execute(stmt))  # the simple protocol runs both commands
+    f = tmp_path / "x.sql"
+    f.write_text("alter table orders add column a int; rollback; alter table orders add column b int")
+    assert cli.main([str(f), "--rollback", "--dsn", dsn]) == 3
+    out = capsys.readouterr()
+    assert "NOT ROLLED BACK" in out.err and "Rolled back" not in out.out
+
+
+def test_a_bad_set_is_reported_and_does_not_poison_the_run(conn):
+    with conn.transaction(force_rollback=True):
+        res = [x for x in check(conn, "set lock_timeout = 'soon'; alter table orders add column a int", rollback=True) if x.n]
+    assert len(res) == 1 and "InvalidParameterValue" in res[0].error
+    applied = [x for x in check(conn, "set lock_timeout = 'soon'; alter table orders add column a int") if x.n]
+    assert len(applied) == 1 and applied[0].error

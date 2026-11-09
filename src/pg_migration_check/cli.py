@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from .check import LOCKS, check, held_until_commit
+from .check import LOCKS, TransactionEnded, check, held_until_commit
 from .seed import counts_from, parse_rows, seed
 from .seed import report as seed_report
 
@@ -108,6 +108,9 @@ def main(argv=None) -> int:
         except ValueError as e:  # a file --rollback refuses: nothing was run
             print(f"pg-migration-check: {e}", file=sys.stderr)
             return 2
+        except TransactionEnded as e:  # never claim a rollback that did not happen
+            print(f"pg-migration-check: NOT ROLLED BACK: {e}", file=sys.stderr)
+            return 3
         if a.rollback and not a.json:
             print("\nRolled back: the database is as it was before the run (sequences excepted).")
     if a.json:
