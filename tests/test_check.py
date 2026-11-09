@@ -165,3 +165,9 @@ def test_concurrent_shapes():
 def test_split_knows_escape_strings_and_dollar_tags_with_digits():
     out = split("select E'it\\'s; fine'; select e'\\\\'; select $f1$ a; b $f1$; select 'a''b;c'")
     assert out == ["select E'it\\'s; fine'", "select e'\\\\'", "select $f1$ a; b $f1$", "select 'a''b;c'"]
+
+
+def test_a_missing_file_is_a_one_line_error(dsn, tmp_path):
+    r = subprocess.run([sys.executable, "-m", "pg_migration_check", str(tmp_path / "nope.sql"), "--dsn", dsn],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "no such file" in r.stderr and "Traceback" not in r.stderr

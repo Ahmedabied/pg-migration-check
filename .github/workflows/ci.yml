@@ -41,3 +41,23 @@ jobs:
           pg-migration-check examples/0003_safe.sql --dsn postgresql://postgres:ci@localhost:5432/demo
       - name: --rollback leaves a 100k row table exactly as it was
         run: python bench/rollback.py --rows 100000 --dsn "$PGMC_TEST_DSN"
+      - name: a fresh copy of the example schema for the action
+        run: |
+          psql "$PGMC_TEST_DSN" -c "create database action_demo"
+          psql "postgresql://postgres:ci@localhost:5432/action_demo" -f examples/schema.sql
+      - name: the action fails the unsafe example (this step is expected to fail)
+        id: unsafe
+        continue-on-error: true
+        uses: ./
+        with:
+          files: examples/0002_unsafe.sql
+          dsn: postgresql://postgres:ci@localhost:5432/action_demo
+          rollback: "true"
+      - name: it did fail
+        run: test "${{ steps.unsafe.outcome }}" = failure
+      - name: the action passes the safe example, globs expanded
+        uses: ./
+        with:
+          files: examples/0003_*.sql
+          dsn: postgresql://postgres:ci@localhost:5432/action_demo
+          rollback: "true"

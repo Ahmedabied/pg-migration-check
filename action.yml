@@ -1,0 +1,58 @@
+name: pg-migration-check
+description: Apply Postgres migrations to a scratch database (or a staging copy, rolled back) and fail on locks and rewrites that would hurt live traffic.
+branding:
+  icon: database
+  color: blue
+inputs:
+  files:
+    description: Migration files, applied in order. Space separated; globs such as migrations/new/*.sql are expanded.
+    required: true
+  dsn:
+    description: The database to check against. A scratch database gets the migration applied; with rollback, a staging copy is left as it was.
+    required: true
+  rollback:
+    description: "true: run everything in one transaction and roll it back (for a copy that already holds real data). Never production."
+    default: "false"
+  rows:
+    description: Fill the empty tables the files name with this many synthetic rows first (--rows). Not with rollback.
+    default: ""
+  fail-on:
+    description: danger, warn or never.
+    default: danger
+  slow-ms:
+    description: ACCESS EXCLUSIVE held this long is a danger.
+    default: "1000"
+runs:
+  using: composite
+  steps:
+    - name: Install pg-migration-check (this action's own version)
+      shell: bash
+      run: |
+        python3 -m venv "$RUNNER_TEMP/pg-migration-check"
+        "$RUNNER_TEMP/pg-migration-check/bin/pip" install --quiet "$GITHUB_ACTION_PATH"
+    - name: Check the migrations
+      shell: bash
+      env:
+        PGMC_FILES: ${{ inputs.files }}
+        PGMC_DSN: ${{ inputs.dsn }}
+        PGMC_ROLLBACK: ${{ inputs.rollback }}
+        PGMC_ROWS: ${{ inputs.rows }}
+        PGMC_FAIL_ON: ${{ inputs.fail-on }}
+        PGMC_SLOW_MS: ${{ inputs.slow-ms }}
+      run: |
+        set -o pipefail
+        shopt -s nullglob
+        files=( $PGMC_FILES )  # word splitting and globs only: nothing in the input is run
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "pg-migration-check: no migration files match: $PGMC_FILES"
+          exit 0
+        fi
+        args=(--dsn "$PGMC_DSN" --fail-on "$PGMC_FAIL_ON" --slow-ms "$PGMC_SLOW_MS")
+        [ "$PGMC_ROLLBACK" = "true" ] && args+=(--rollback)
+        [ -n "$PGMC_ROWS" ] && args+=(--rows "$PGMC_ROWS")
+        set +e
+        "$RUNNER_TEMP/pg-migration-check/bin/pg-migration-check" "${files[@]}" "${args[@]}" | tee "$RUNNER_TEMP/pgmc.txt"
+        code=$?
+        set -e
+        { echo '### pg-migration-check'; echo '```'; cat "$RUNNER_TEMP/pgmc.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+        exit $code

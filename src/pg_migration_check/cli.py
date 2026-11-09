@@ -73,6 +73,9 @@ def main(argv=None) -> int:
     sizes = counts_from(a.rows_from) if a.rows_from else None
     if not a.dsn:
         p.error("give --dsn or set DATABASE_URL (a scratch database: the migration is applied)")
+    missing = [f for f in a.files if not Path(f).is_file()]
+    if missing:
+        p.error(f"no such file: {missing[0]}")
     import contextlib
 
     import psycopg

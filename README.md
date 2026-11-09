@@ -36,7 +36,8 @@ savepoint of one transaction with `--rollback`), and before it commits the tool 
 
 A few risks the locks cannot show are read from the SQL: renames and dropped columns (they break code that is still
 running), `SET NOT NULL` without a validated `CHECK`, constraints added without `NOT VALID`, and no `lock_timeout`.
-Tables created earlier in the same file are skipped: nothing live uses them yet.
+Tables created earlier in the same file are skipped: nothing live uses them yet (with `--rollback`, only until
+the file has locked a live table; after that the SQL rules still speak about the new tables too).
 
 ## Measured: lock time on a 1M row table
 
@@ -164,18 +165,32 @@ reported).
 ## In GitHub Actions
 
 ```yaml
-services:
-  postgres:
-    image: postgres:16
-    env: { POSTGRES_PASSWORD: ci }
-    ports: ["5432:5432"]
-steps:
-  - run: pip install git+https://github.com/Ahmedabied/pg-migration-check
-  - run: psql "$DSN" -f schema.sql      # your schema and some rows: lock time depends on them
-  - run: pg-migration-check migrations/new/*.sql --dsn "$DSN"
+jobs:
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: ci }
+        ports: ["5432:5432"]
+    env:
+      DSN: postgresql://postgres:ci@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - run: psql "$DSN" -f schema.sql      # your schema and some rows: lock time depends on them
+      - uses: Ahmedabied/pg-migration-check@v0.2.0
+        with:
+          files: migrations/new/*.sql
+          dsn: ${{ env.DSN }}
 ```
 
-This repository's own CI runs the tests and both examples on Postgres 14, 16 and 17.
+The pull request fails on a danger, and the report lands in the job summary. Against a staging copy instead, give
+its address as a secret and set `rollback: "true"`. Other inputs: `rows`, `fail-on`, `slow-ms`. When no file
+matches, the step passes and says so. The action installs the version of the checker it is pinned to, in its own
+virtualenv, and passes the inputs through environment variables, so a file name cannot run a command.
+
+This repository's own CI runs the tests and both examples on Postgres 14, 16 and 17, and runs the action itself
+on both examples with `rollback`.
 
 ## Limits
 
@@ -197,7 +212,7 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 52 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 53 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.
