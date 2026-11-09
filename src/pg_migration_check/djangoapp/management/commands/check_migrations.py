@@ -20,7 +20,7 @@ from pg_migration_check.cli import report
 from pg_migration_check.seed import counts_from, parse_rows, seed
 from pg_migration_check.seed import report as seed_report
 
-RANK = {"info": 0, "warn": 1, "danger": 2}
+RANK = {"info": 0, "note": 0, "warn": 1, "danger": 2}
 
 
 class Command(BaseCommand):

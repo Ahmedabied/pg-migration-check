@@ -13,6 +13,8 @@ import re
 import time
 from dataclasses import dataclass, field
 
+import psycopg
+
 # What each table lock mode blocks for other sessions, in plain words.
 LOCKS = {
     "AccessShareLock": (1, "ACCESS SHARE", "only ACCESS EXCLUSIVE"),
@@ -40,7 +42,7 @@ where l.pid = pg_backend_pid() and l.locktype = 'relation' and l.granted
 
 @dataclass
 class Finding:
-    level: str  # "danger", "warn", "info"
+    level: str  # "danger", "warn", "info", "note" (always shown, never fails a run)
     text: str
 
 
@@ -151,7 +153,8 @@ def _table_of(conn, name: str, index: bool) -> str:
          + ("join pg_index i on i.indrelid = t.oid where i.indexrelid = to_regclass(%s)" if index
             else "where t.oid = to_regclass(%s)"))
     try:
-        row = conn.execute(q, (name,)).fetchone()
+        with conn.transaction():  # a savepoint under --rollback: a failed lookup must not end the run's transaction
+            row = conn.execute(q, (name,)).fetchone()
     except Exception:
         row = None
     return row[0] if row else re.sub(r'\s|"', "", name)
@@ -182,21 +185,51 @@ def _has_valid_not_null_check(conn, stmt: str) -> bool:
         return False
     table, col = m.group(1), m.group(2).strip('"')
     try:
-        row = conn.execute(
-            "select count(*) from pg_constraint where conrelid = to_regclass(%s) and contype = 'c' and convalidated "
-            "and regexp_replace(pg_get_constraintdef(oid), '[()\"]', '', 'g') ilike %s",
-            (table, f"CHECK {col} IS NOT NULL")).fetchone()
+        with conn.transaction():  # a savepoint under --rollback: a failed lookup must not end the run's transaction
+            row = conn.execute(
+                "select count(*) from pg_constraint where conrelid = to_regclass(%s) and contype = 'c' and convalidated "
+                "and regexp_replace(pg_get_constraintdef(oid), '[()\"]', '', 'g') ilike %s",
+                (table, f"CHECK {col} IS NOT NULL")).fetchone()
         return bool(row and row[0])
     except Exception:
         return False
 
 
-def check(conn, sql: str, slow_ms: float = 1000.0) -> list[Result]:
+def plain(stmt: str) -> str:
+    """The statement without CONCURRENTLY, so it can run inside a transaction (--rollback measures it that way)."""
+    if re.match(r"\s*ALTER\s", stmt, re.I):  # ... DETACH PARTITION p CONCURRENTLY
+        return re.sub(r"\s+CONCURRENTLY\s*$", "", stmt, flags=re.I)
+    if re.match(r"\s*REINDEX\s*\([^)]*\bCONCURRENTLY\b", stmt, re.I):  # the option form: REINDEX (CONCURRENTLY) ...
+        return re.sub(r"\bCONCURRENTLY(\s+(TRUE|ON|1))?\b", "CONCURRENTLY FALSE", stmt, count=1, flags=re.I)
+    return re.sub(r"\bCONCURRENTLY\b", "", stmt, count=1, flags=re.I)
+
+
+class TransactionEnded(RuntimeError):
+    """Under --rollback the run's one transaction ended early: what ran after it was not rolled back."""
+
+
+# Statements that would end the one transaction --rollback depends on.
+ENDS_TRANSACTION = re.compile(r"(ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE TRANSACTION|COMMIT PREPARED|ROLLBACK PREPARED)\b")
+WRAPPER = re.compile(r"(BEGIN|COMMIT|START TRANSACTION|END)(\s+\w+)*")
+
+
+def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> list[Result]:
     """Apply `sql` to the database behind `conn` (a psycopg connection to a scratch database), one statement per
-    transaction, and return what each statement did. Stops at the first error, like a migration would."""
-    conn.autocommit = True
+    transaction, and return what each statement did. Stops at the first error, like a migration would.
+
+    rollback=True: the caller has opened one transaction and rolls it back afterwards (cli --rollback). Each statement
+    runs in a savepoint inside it and shows the locks it added; a lock an earlier statement took is still held and is
+    not shown again. A CONCURRENTLY statement cannot run in a transaction, so its plain form is run to time it."""
+    stmts = [s for s in split(sql) if not WRAPPER.fullmatch(_norm(s))]
+    if rollback:
+        ends = [s for s in stmts if ENDS_TRANSACTION.match(_norm(s))]
+        if ends:
+            raise ValueError(f"--rollback cannot run a file that ends or splits its transaction: {ends[0][:60]!r}")
+        if conn.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
+            raise ValueError("rollback=True needs an open transaction (conn.transaction(force_rollback=True))")
+    else:
+        conn.autocommit = True
     results: list[Result] = []
-    stmts = [s for s in split(sql) if not re.fullmatch(r"(BEGIN|COMMIT|START TRANSACTION|END)(\s+\w+)*", _norm(s))]
     live = {row[1] for row in conn.execute(SNAPSHOT).fetchall()}  # tables that exist before the file: live traffic
     for n, stmt in enumerate(stmts, 1):
         r = Result(n, stmt, findings=text_rules(stmt))
@@ -210,23 +243,26 @@ def check(conn, sql: str, slow_ms: float = 1000.0) -> list[Result]:
             continue
         r.concurrently = is_concurrent(stmt)
         try:
-            if r.concurrently:  # cannot run in a transaction block; its locks are released before we could read them
+            if r.concurrently and not rollback:  # cannot run in a transaction block; its locks are gone when it returns
                 locks = concurrent_locks(conn, stmt)
                 t = time.perf_counter()
                 conn.execute(stmt)
                 r.ms = (time.perf_counter() - t) * 1000
                 r.locks = locks
             else:
-                with conn.transaction():
+                declared = concurrent_locks(conn, stmt) if r.concurrently else None
+                with conn.transaction():  # a savepoint under --rollback
+                    held_before = set(conn.execute(MY_LOCKS).fetchall())
                     before = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
                     t = time.perf_counter()
-                    conn.execute(stmt)
+                    conn.execute(plain(stmt) if r.concurrently else stmt)
                     r.ms = (time.perf_counter() - t) * 1000
-                    held = conn.execute(MY_LOCKS).fetchall()
+                    held_all = conn.execute(MY_LOCKS).fetchall()
                     after = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
                     names = {oid: row[1] for oid, row in {**before, **after}.items()}
-                    for oid, mode in held:
-                        if oid in names and after.get(oid, before.get(oid))[2] in ("r", "p", "m"):
+                    tables = {oid for oid in names if after.get(oid, before.get(oid))[2] in ("r", "p", "m")}
+                    for oid, mode in held_all:
+                        if oid in tables and (oid, mode) not in held_before:  # what this statement added
                             name = names[oid]
                             if LOCKS.get(mode, (0,))[0] > LOCKS.get(r.locks.get(name, ""), (0,))[0]:
                                 r.locks[name] = mode
@@ -237,11 +273,20 @@ def check(conn, sql: str, slow_ms: float = 1000.0) -> list[Result]:
                     r.locks = {t: m for t, m in r.locks.items() if t in live}
                     r.rewritten = [t for t in r.rewritten if t in live]
                     r.rows = {names[o]: int(max(before[o][4], 0)) for o in before if names[o] in r.locks}
-                    if not r.locks:
+                    if not any(names[oid] in live for oid, _ in held_all if oid in tables):
                         r.findings = []  # only touched tables made by this file: no live traffic to hurt
+                if declared is not None:  # report what the real CONCURRENTLY statement takes, not the plain form
+                    r.locks, r.rows, r.rewritten = declared, {}, []
+                    r.findings.append(Finding("note", "timed without CONCURRENTLY inside the rollback transaction; "
+                        "the real statement blocks no reads or writes, and a CONCURRENTLY index build reads the table "
+                        "twice, so expect it to take longer"))
+            if rollback and conn.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
+                raise TransactionEnded(f"statement {n} ended the rollback transaction; the database may have been changed")
         except Exception as e:  # report and stop, as the migration would
             r.error = f"{type(e).__name__}: {str(e).strip().splitlines()[0]}"
             results.append(r)
+            if isinstance(e, TransactionEnded):
+                raise
             break
         existing = {t for t in r.locks if t in r.rows}
         for t, mode in r.locks.items():

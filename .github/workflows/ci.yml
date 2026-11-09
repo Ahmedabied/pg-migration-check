@@ -39,3 +39,5 @@ jobs:
           set -e
           test $code -eq 1
           pg-migration-check examples/0003_safe.sql --dsn postgresql://postgres:ci@localhost:5432/demo
+      - name: --rollback leaves a 100k row table exactly as it was
+        run: python bench/rollback.py --rows 100000 --dsn "$PGMC_TEST_DSN"

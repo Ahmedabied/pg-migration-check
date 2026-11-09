@@ -27,8 +27,8 @@ the same change passes clean.
 
 ## How it knows
 
-It does not guess from the SQL text. Each statement runs in its own transaction on the scratch database, and before
-it commits the tool asks Postgres:
+It does not guess from the SQL text. Each statement runs in its own transaction on the scratch database (in a
+savepoint of one transaction with `--rollback`), and before it commits the tool asks Postgres:
 
 - **which locks it holds**, from `pg_locks` for its own backend, mapped to what each mode blocks;
 - **whether a table was rewritten**, because its `relfilenode` changed;
@@ -73,9 +73,9 @@ pg-migration-check migrations/0042.sql --dsn postgresql://postgres:ci@localhost:
 python manage.py sqlmigrate shop 0042 > /tmp/0042.sql && pg-migration-check /tmp/0042.sql   # Django
 ```
 
-**The database gets changed**: the migration is applied. Point it at a CI service container or a copy, never at
-production. Options: `--fail-on danger|warn|never`, `--slow-ms` (ACCESS EXCLUSIVE held this long is a danger,
-default 1000), `--json`, `-v` to show brief locks too, and `--rows N` (below).
+**The database gets changed**: the migration is applied (unless `--rollback`, below). Point it at a CI service
+container or a copy, never at production. Options: `--fail-on danger|warn|never`, `--slow-ms` (ACCESS EXCLUSIVE held this long is a danger,
+default 1000), `--json`, `-v` to show brief locks too, `--rows N` and `--rollback` (below).
 
 **`--rows N` gives an empty scratch database production's weight.** Before the migration runs, every empty table
 it names, and every table those reference, gets N synthetic rows from one `INSERT ... SELECT` over
@@ -89,6 +89,27 @@ tables get production's row counts. Tables never analyzed there have no estimate
 Give it a login role with no privileges at all (`CREATE ROLE stats LOGIN PASSWORD '...'`): every role can read
 `pg_class`, so it sees the counts but cannot read a single row of your tables (tested). The session is read only
 either way, but the credential sits in your CI, so make it one that cannot do harm.
+
+**`--rollback` checks a staging copy and leaves it as it was.** Empty tables and synthetic rows only go so far;
+a copy of production has the real row widths, indexes and bloat. With `--rollback` the whole run is one
+transaction, each statement in a savepoint inside it, and the transaction is rolled back at the end, so the next
+pull request can check its migration against the same copy. On a 1M row `orders` table (93 MB with indexes,
+Postgres 16.2) the run of `examples/0002_unsafe.sql` took 1.8 s, with the type change rewriting the table in
+594 to 782 ms and the index build at 924 to 998 ms, and afterwards the schema, the file behind every table and
+index, and an md5 of every row were identical to before (`python bench/rollback.py`, two runs).
+
+What changes in the report: each statement shows the locks it adds. A lock an earlier statement took is still
+held, which is how one transaction works and how Django runs a migration, so a later statement on the same table
+can show none (Postgres does not even record a weaker lock under an ACCESS EXCLUSIVE it already holds); the
+summary line gives how long each table stayed locked. `CREATE INDEX CONCURRENTLY` (and the other forms that refuse a
+transaction) runs in its plain form so it can be timed and later statements that use the index still work; the
+report says so and shows the locks the real statement takes.
+
+Never point it at production: every lock is held until the run ends. A rewrite writes a full copy of the table
+(disk and WAL) before the rollback throws it away; sequences moved by `nextval` stay moved, as Postgres never rolls
+them back; two runs on the same copy at once wait for each other. A file that ends or splits its own transaction
+(`ROLLBACK`, `SAVEPOINT`, `PREPARE TRANSACTION`) is refused before anything runs, the run stops if the transaction
+ever ends early, and `--rows` is not allowed with it.
 
 ## In a Django project
 
@@ -150,7 +171,8 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 - **It cannot see lock waits.** On a busy production table a migration first waits for running queries; that wait is
   the classic outage, and the reason for `lock_timeout`, which it checks for.
 - **One statement per transaction.** Django wraps a migration in one transaction; the summary line adds up how long
-  each table stays locked in that case.
+  each table stays locked in that case. `--rollback` runs the whole run in one transaction: with several files,
+  a lock the first file took is still held in the second, which then shows only the locks it adds.
 - **`--rows` picks tables by name.** A table is filled when its name appears as a word anywhere in the migration's
   SQL, so a table called like a common column (`name`, `email`) can be filled without being touched. Harmless, but
   at a million rows it costs seconds; `--rows that_table=0` turns it off.
@@ -162,7 +184,7 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 32 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 45 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.
