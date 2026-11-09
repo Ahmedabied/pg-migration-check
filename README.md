@@ -107,11 +107,12 @@ report says so and shows the locks the real statement takes.
 
 Never point it at production: every lock is held until the run ends. A rewrite writes a full copy of the table
 (disk and WAL) before the rollback throws it away; sequences moved by `nextval` stay moved, as Postgres never rolls
-them back; two runs on the same copy at once wait for each other. A file that ends or splits its own transaction
-(`ROLLBACK`, `SAVEPOINT`, `PREPARE TRANSACTION`) is refused before anything runs. Each statement goes to the
-server on its own over the extended protocol, which refuses two commands in one string, so a statement the splitter
-got wrong cannot carry a `ROLLBACK` past that check. If the transaction ever ends early anyway, the run stops with
-`NOT ROLLED BACK` and exit code 3. `--rows` is not allowed with it.
+them back, and neither is anything that reaches outside the transaction (dblink, `COPY ... TO PROGRAM`); two runs
+on the same copy at once wait for each other. A file that ends or splits its own transaction (`ROLLBACK`,
+`SAVEPOINT`, `PREPARE TRANSACTION`) is refused before anything runs. Each statement goes to the server on its own
+over the extended protocol, which refuses two commands in one string, so a statement the splitter got wrong cannot
+carry a `ROLLBACK` past that check. If the transaction ever ends early anyway, the run stops with `NOT ROLLED BACK`
+and exit code 3. `--rows` is not allowed with it.
 
 ## In a Django project
 
