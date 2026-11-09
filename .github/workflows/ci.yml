@@ -1,0 +1,38 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        postgres: ["14", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      PGMC_TEST_DSN: postgresql://postgres:ci@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[test]'
+      - run: pytest -q
+      - name: the example migration is caught
+        run: |
+          psql "$PGMC_TEST_DSN" -c "create database demo"
+          psql "postgresql://postgres:ci@localhost:5432/demo" -f examples/schema.sql
+          set +e
+          pg-migration-check examples/0002_unsafe.sql --dsn postgresql://postgres:ci@localhost:5432/demo; code=$?
+          set -e
+          test $code -eq 1
+          pg-migration-check examples/0003_safe.sql --dsn postgresql://postgres:ci@localhost:5432/demo

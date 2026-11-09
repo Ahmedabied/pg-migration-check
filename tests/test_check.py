@@ -1,0 +1,115 @@
+import json
+import subprocess
+import sys
+
+from pg_migration_check.check import check, held_until_commit, split, text_rules
+
+
+def levels(r):
+    return [f.level for f in r.findings]
+
+
+def test_split_respects_quotes_comments_and_dollar_quotes():
+    sql = """-- a comment; with a semicolon
+    insert into t values ('a;b', 'it''s; fine');
+    /* block; comment */ create function f() returns int as $$ select 1; $$ language sql;
+    select "odd;name" from t"""
+    out = split(sql)
+    assert len(out) == 3
+    assert "'a;b'" in out[0] and "$$ select 1; $$" in out[1] and out[2].endswith('from t')
+
+
+def test_rewrite_is_seen_and_is_a_danger(conn):
+    (r,) = [x for x in check(conn, "alter table orders alter column qty type bigint") if x.n]
+    assert r.rewritten == ["public.orders"]
+    assert r.locks["public.orders"] == "AccessExclusiveLock"
+    assert "danger" in levels(r)
+
+
+def test_adding_a_nullable_column_does_not_rewrite(conn):
+    (r,) = [x for x in check(conn, "set lock_timeout = '2s'; alter table orders add column note text") if x.n == 2]
+    assert r.rewritten == [] and r.locks["public.orders"] == "AccessExclusiveLock"
+    assert "danger" not in levels(r)
+
+
+def test_a_constant_default_does_not_rewrite_but_a_volatile_one_does(conn):
+    res = check(conn, "set lock_timeout='2s'; alter table orders add column a int not null default 0;"
+                      "alter table orders add column b float8 default random()")
+    a, b = [x for x in res if x.n in (2, 3)]
+    assert a.rewritten == [] and b.rewritten == ["public.orders"]
+
+
+def test_index_without_concurrently_blocks_writes(conn):
+    (r,) = [x for x in check(conn, "create index on orders (email)") if x.n]
+    assert r.locks["public.orders"] == "ShareLock"
+    assert any("CONCURRENTLY" in f.text for f in r.findings)
+
+
+def test_concurrent_index_runs_outside_a_transaction(conn):
+    res = check(conn, "create index concurrently orders_email on orders (email)")
+    (r,) = [x for x in res if x.n]
+    assert r.error is None and r.concurrently and r.locks == {"orders": "ShareUpdateExclusiveLock"}
+    assert not any(f.level != "info" for f in r.findings)
+    assert held_until_commit(res) == {}
+    assert conn.execute("select count(*) from pg_indexes where indexname = 'orders_email'").fetchone()[0] == 1
+
+
+def test_foreign_key_locks_both_tables_and_not_valid_is_the_fix(conn):
+    (r,) = [x for x in check(conn, "alter table orders add foreign key (customer_id) references customers (id)") if x.n]
+    assert r.locks["public.orders"] == "ShareRowExclusiveLock" and r.locks["public.customers"] == "ShareRowExclusiveLock"
+    assert any("NOT VALID" in f.text for f in r.findings)
+    assert not text_rules("alter table orders add constraint fk foreign key (customer_id) references customers (id) not valid")
+
+
+def test_rename_is_a_danger_for_running_code(conn):
+    (r,) = [x for x in check(conn, "alter table orders rename column email to mail") if x.n]
+    assert "danger" in levels(r)
+    assert not [f for f in text_rules("alter table orders rename constraint a to b") if "rename" in f.text]
+
+
+def test_missing_lock_timeout_is_reported_once(conn):
+    res = check(conn, "create index on orders (qty); create index on orders (email)")
+    assert sum(1 for x in res if x.n == 0) == 1
+    assert not any(x.n == 0 for x in check(conn, "set lock_timeout = '1s'; create index on orders (created_at)"))
+
+
+def test_django_transaction_wrapper_is_ignored_and_lock_time_adds_up(conn):
+    res = check(conn, "BEGIN;\nalter table orders alter column qty type bigint;\ncreate index on orders (email);\nCOMMIT;")
+    stmts = [x for x in res if x.n]
+    assert len(stmts) == 2
+    held = held_until_commit(res)
+    assert abs(held["public.orders"] - sum(x.ms for x in stmts)) < 0.01
+
+
+def test_stops_at_the_first_error(conn):
+    res = check(conn, "alter table nope add column x int; alter table orders add column y int")
+    stmts = [x for x in res if x.n]
+    assert len(stmts) == 1 and "UndefinedTable" in stmts[0].error
+
+
+def test_new_tables_are_not_reported(conn):
+    res = check(conn, "create table fresh (id int); create index on fresh (id); alter table fresh alter column id type bigint")
+    assert all(x.findings == [] and x.locks == {} for x in res)
+
+
+def test_cli_exit_codes_and_json(dsn, tmp_path):
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("create table t (id int, v int)")
+        c.execute("insert into t select g, g from generate_series(1, 1000) g")
+        c.execute("analyze t")
+    bad = tmp_path / "bad.sql"
+    bad.write_text("alter table t alter column v type bigint;")
+    good = tmp_path / "good.sql"
+    good.write_text("set lock_timeout = '2s'; alter table t add column note text;")
+    run = lambda *a: subprocess.run([sys.executable, "-m", "pg_migration_check", *a, "--dsn", dsn], capture_output=True, text=True)
+    r = run(str(bad))
+    assert r.returncode == 1 and "DANGER" in r.stdout and "rewrites public.t" in r.stdout
+    r = run(str(good))
+    assert r.returncode == 0, r.stdout
+    good2 = tmp_path / "good2.sql"
+    good2.write_text("set lock_timeout = '2s'; alter table t add column other text;")
+    r = run(str(good2), "--json", "--fail-on", "never")
+    data = json.loads(r.stdout)
+    assert data[0]["statements"][1]["locks"] == {"public.t": "ACCESS EXCLUSIVE"}

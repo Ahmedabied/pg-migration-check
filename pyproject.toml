@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pg-migration-check"
+version = "0.1.0"
+description = "Apply a Postgres migration to a scratch database and report the locks, rewrites and lock time of each statement."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Ahmed Abied" }]
+requires-python = ">=3.10"
+dependencies = ["psycopg[binary]>=3.1"]
+keywords = ["postgres", "postgresql", "migrations", "django", "ci", "locks", "zero-downtime"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+local = ["pgserver>=0.1.4"]
+
+[project.scripts]
+pg-migration-check = "pg_migration_check.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pg_migration_check"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
