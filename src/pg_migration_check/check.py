@@ -131,6 +131,23 @@ def text_rules(sql: str) -> list[Finding]:
     return f
 
 
+def _has_valid_not_null_check(conn, stmt: str) -> bool:
+    """Postgres 12+ skips the SET NOT NULL scan when a validated CHECK (col IS NOT NULL) exists."""
+    m = re.match(r'\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?("?[\w.]+"?)\s+ALTER\s+(?:COLUMN\s+)?("?\w+"?)\s+SET\s+NOT\s+NULL',
+                 stmt, re.I)
+    if not m:
+        return False
+    table, col = m.group(1), m.group(2).strip('"')
+    try:
+        row = conn.execute(
+            "select count(*) from pg_constraint where conrelid = to_regclass(%s) and contype = 'c' and convalidated "
+            "and regexp_replace(pg_get_constraintdef(oid), '[()\"]', '', 'g') ilike %s",
+            (table, f"CHECK {col} IS NOT NULL")).fetchone()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
 def check(conn, sql: str, slow_ms: float = 1000.0) -> list[Result]:
     """Apply `sql` to the database behind `conn` (a psycopg connection to a scratch database), one statement per
     transaction, and return what each statement did. Stops at the first error, like a migration would."""
@@ -141,6 +158,9 @@ def check(conn, sql: str, slow_ms: float = 1000.0) -> list[Result]:
     for n, stmt in enumerate(stmts, 1):
         r = Result(n, stmt, findings=text_rules(stmt))
         s = _norm(stmt)
+        m = re.match(r'ALTER TABLE (?:ONLY )?(?:IF EXISTS )?("?[\w.]+"?) ALTER (?:COLUMN )?("?\w+"?) SET NOT NULL$', s)
+        if m and _has_valid_not_null_check(conn, stmt):
+            r.findings = [f for f in r.findings if not f.text.startswith("SET NOT NULL")]
         if re.match(r"SET\s+(LOCAL\s+)?(LOCK_TIMEOUT|STATEMENT_TIMEOUT)\b", s):
             conn.execute(stmt)
             results.append(r)

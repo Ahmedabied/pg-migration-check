@@ -29,9 +29,12 @@ def report(path: str, results, out, verbose: bool = False) -> None:
                 out.write(f"      {MARK[f.level]}  {f.text}\n")
     held = held_until_commit(results)
     if held:
-        out.write("  If the whole file runs in one transaction (Django does this unless atomic = False), writes wait on:\n")
+        out.write("  If the whole file runs in one transaction (Django does this unless atomic = False), the locks are "
+                  "held until it commits:\n")
         for t, ms in held.items():
-            out.write(f"      {t}: {ms:,.0f} ms\n")
+            top = max((LOCKS[r.locks[t]][0] for r in results if t in r.locks and r.locks[t] in LOCKS), default=0)
+            who = "reads and writes wait" if top == 8 else "writes wait"
+            out.write(f"      {t}: {who} {ms:,.0f} ms\n")
 
 
 def main(argv=None) -> int:

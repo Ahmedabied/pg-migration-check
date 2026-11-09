@@ -113,3 +113,14 @@ def test_cli_exit_codes_and_json(dsn, tmp_path):
     r = run(str(good2), "--json", "--fail-on", "never")
     data = json.loads(r.stdout)
     assert data[0]["statements"][1]["locks"] == {"public.t": "ACCESS EXCLUSIVE"}
+
+
+def test_set_not_null_after_a_validated_check_is_not_flagged(conn):
+    res = check(conn, "set lock_timeout = '2s';"
+                      "alter table orders add constraint e_nn check (email is not null) not valid;"
+                      "alter table orders validate constraint e_nn;"
+                      "alter table orders alter column email set not null")
+    last = [x for x in res if x.n == 4][0]
+    assert last.error is None and not [f for f in last.findings if f.level != "info"]
+    plain = [x for x in check(conn, "set lock_timeout = '2s'; alter table orders alter column qty set not null") if x.n == 2][0]
+    assert any(f.text.startswith("SET NOT NULL") for f in plain.findings)
