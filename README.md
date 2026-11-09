@@ -94,6 +94,7 @@ will meet in production, with Django's own SQL (what `sqlmigrate` prints). The o
 already applied are applied silently; the rest are reported statement by statement, with the lock time a Django
 migration really has: one transaction, so every lock is held until the last statement commits (unless the migration
 says `atomic = False`). It exits 1 on a danger, like the command line tool. The scratch database must be empty.
+CI tests it with Django 6.1 on Postgres 16 and 17, and Django 5.2 on Postgres 14 (Django 6 needs Postgres 15).
 
 Run on every migration of Django's own contrib apps (admin, auth, contenttypes, sessions, sites, flatpages,
 redirects; Django 6.1.3): 23 migrations, 63 statements, checked in 0.14 s. No dangers on these empty tables, and 20

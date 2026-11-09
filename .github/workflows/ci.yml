@@ -26,6 +26,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e '.[test]'
+      - name: Django 6 needs Postgres 15 or newer; test Postgres 14 with Django 5.2 LTS
+        if: matrix.postgres == '14'
+        run: pip install 'django>=5.2,<6'
       - run: pytest -q
       - name: the example migration is caught
         run: |
