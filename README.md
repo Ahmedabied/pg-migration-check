@@ -76,6 +76,31 @@ python manage.py sqlmigrate shop 0042 > /tmp/0042.sql && pg-migration-check /tmp
 production. Options: `--fail-on danger|warn|never`, `--slow-ms` (ACCESS EXCLUSIVE held this long is a danger,
 default 1000), `--json`, `-v` to show brief locks too.
 
+## In a Django project
+
+```sh
+pip install 'pg-migration-check[django] @ git+https://github.com/Ahmedabied/pg-migration-check'
+```
+
+Add `"pg_migration_check.djangoapp"` to `INSTALLED_APPS`, then:
+
+```sh
+python manage.py check_migrations --dsn postgresql://localhost/scratch          # what is not applied yet
+python manage.py check_migrations shop --all --dsn postgresql://localhost/scratch  # every migration of one app
+```
+
+It builds the scratch database from nothing by applying every migration in order, so each one meets the schema it
+will meet in production, with Django's own SQL (what `sqlmigrate` prints). The ones your `default` database has
+already applied are applied silently; the rest are reported statement by statement, with the lock time a Django
+migration really has: one transaction, so every lock is held until the last statement commits (unless the migration
+says `atomic = False`). It exits 1 on a danger, like the command line tool. The scratch database must be empty.
+
+Run on every migration of Django's own contrib apps (admin, auth, contenttypes, sessions, sites, flatpages,
+redirects; Django 6.1.3): 23 migrations, 63 statements, checked in 0.14 s. No dangers on these empty tables, and 20
+warnings worth knowing before you copy their patterns onto a big table: 13 migrations with no `lock_timeout`, 5 foreign
+keys or checks added without `NOT VALID` (checked against every row while writes wait), 1 column drop, and 1 index
+built without `CONCURRENTLY` (`sites.0002`).
+
 ## In GitHub Actions
 
 ```yaml
@@ -100,13 +125,15 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
   the classic outage, and the reason for `lock_timeout`, which it checks for.
 - **One statement per transaction.** Django wraps a migration in one transaction; the summary line adds up how long
   each table stays locked in that case.
-- **SQL files only.** Django works through `sqlmigrate`. Other frameworks need their SQL output.
+- **SQL files and Django.** Django has its own command (above); other frameworks need their SQL output. In Django,
+  data migrations (`RunPython`) are not run on the scratch database, so a later migration that needs their data fails
+  there.
 
 ## Development
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 14 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 17 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.

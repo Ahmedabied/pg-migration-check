@@ -13,7 +13,8 @@ from .check import LOCKS, check, held_until_commit
 MARK = {"danger": "DANGER", "warn": "warn  ", "info": "info  "}
 
 
-def report(path: str, results, out, verbose: bool = False) -> None:
+def report(path: str, results, out, verbose: bool = False, one_transaction: bool | None = None) -> None:
+    """one_transaction: True when the file is known to run in one transaction, False when it is known not to."""
     out.write(f"\n{path}\n")
     for r in results:
         if r.n == 0:
@@ -27,9 +28,11 @@ def report(path: str, results, out, verbose: bool = False) -> None:
         for f in r.findings:
             if f.level != "info" or verbose:
                 out.write(f"      {MARK[f.level]}  {f.text}\n")
-    held = held_until_commit(results)
+    held = held_until_commit(results) if one_transaction is not False else {}
     if held:
-        out.write("  If the whole file runs in one transaction (Django does this unless atomic = False), the locks are "
+        out.write("  Django runs this migration in one transaction, so the locks are held until it commits:\n"
+                  if one_transaction else
+                  "  If the whole file runs in one transaction (Django does this unless atomic = False), the locks are "
                   "held until it commits:\n")
         for t, ms in held.items():
             top = max((LOCKS[r.locks[t]][0] for r in results if t in r.locks and r.locks[t] in LOCKS), default=0)

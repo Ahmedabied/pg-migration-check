@@ -14,8 +14,9 @@ dependencies = ["psycopg[binary]>=3.1"]
 keywords = ["postgres", "postgresql", "migrations", "django", "ci", "locks", "zero-downtime"]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "django>=4.2"]
 local = ["pgserver>=0.1.4"]
+django = ["django>=4.2"]
 
 [project.scripts]
 pg-migration-check = "pg_migration_check.cli:main"
