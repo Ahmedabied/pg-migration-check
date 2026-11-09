@@ -63,7 +63,8 @@ python bench/bench.py --rows 100000
 
 That took 4 seconds from a fresh clone (pip cache warm). The throwaway Postgres comes from
 [pgserver](https://github.com/orm011/pgserver), which has wheels for Python 3.9 to 3.12; the checker itself runs on
-3.10 and newer, and needs no local Postgres when you give it `--dsn`.
+3.10 and newer, and needs no local Postgres when you give it `--dsn`. No Python 3.12 on the machine? uv fetches one:
+`uv venv --python 3.12 .venv && . .venv/bin/activate && uv pip install -e '.[local]'` (4.7 s from a fresh clone).
 
 Against your own scratch database:
 
