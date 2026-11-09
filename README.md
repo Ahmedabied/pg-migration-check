@@ -82,6 +82,9 @@ it names, and every table those reference, gets N synthetic rows from one `INSER
 precision, uuid, dates, json, enums, arrays), foreign keys pointing at real parent rows, sequences moved past them.
 `--rows orders=5000000` sets one table. Tables that already hold rows are left alone; a table it cannot fill (a
 CHECK its values break, a unique boolean) is reported and skipped, never half filled.
+`--rows-from DSN` takes each table's count from another database's statistics instead (`pg_class.reltuples`,
+what the planner already keeps), in a read-only session that scans no table: point it at production and the scratch
+tables get production's row counts. Tables never analyzed there have no estimate and are left empty.
 
 ## In a Django project
 
@@ -152,7 +155,7 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 25 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 27 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.

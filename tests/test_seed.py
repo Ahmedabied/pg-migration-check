@@ -104,3 +104,42 @@ def test_only_the_tables_the_migration_names_and_what_they_reference(empty):
     done = {s.table: s.rows for s in seed(empty, 100, {"public.unrelated": 7}, 'ALTER TABLE "invoice" ADD COLUMN x int;')}
     assert done == {"public.account": 100, "public.invoice": 100, "public.unrelated": 7}
     assert seed(empty, 100, None, "select 1") == []  # names nothing: fills nothing
+
+
+def test_row_counts_from_another_databases_statistics(server_uri, dsn):
+    import uuid
+
+    prod = "p_" + uuid.uuid4().hex[:8]
+    with psycopg.connect(server_uri, autocommit=True) as c:
+        c.execute(f"create database {prod}")
+    prod_dsn = psycopg.conninfo.make_conninfo(server_uri, dbname=prod)
+    try:
+        with psycopg.connect(prod_dsn, autocommit=True) as p:
+            p.execute("create table account (id int primary key); insert into account select generate_series(1, 300)")
+            p.execute("create table invoice (id int, account_id int references account)")
+            p.execute("insert into invoice select g, 1 + g % 300 from generate_series(1, 4000) g")
+            p.execute("create table never_analyzed (id int)")
+            p.execute("analyze account; analyze invoice")
+        from pg_migration_check.seed import counts_from
+
+        sizes = counts_from(prod_dsn)
+        assert sizes == {"public.account": 300, "public.invoice": 4000}  # never analyzed: no estimate, left out
+        with psycopg.connect(dsn, autocommit=True) as s:
+            s.execute("create table account (id int primary key)")
+            s.execute("create table invoice (id int, account_id int references account)")
+            done = {x.table: x.rows for x in seed(s, None, None, "alter table invoice add column x int", sizes)}
+        assert done == {"public.account": 300, "public.invoice": 4000}
+    finally:
+        with psycopg.connect(server_uri, autocommit=True) as c:
+            c.execute(f"drop database {prod} with (force)")
+
+
+def test_cli_rows_from(dsn, tmp_path):
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("create table src (id int); insert into src select generate_series(1, 2500); analyze src")
+    f = tmp_path / "m.sql"
+    f.write_text("alter table src add column v int;\n")
+    # The scratch database reads its own statistics here: the table already has rows, so it is left alone.
+    r = subprocess.run([sys.executable, "-m", "pg_migration_check", "--dsn", dsn, "--rows-from", dsn, str(f)],
+                       capture_output=True, text=True)
+    assert "not filled public.src: already has rows" in r.stdout, r.stdout + r.stderr

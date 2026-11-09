@@ -143,13 +143,36 @@ def mentioned(sql: str, rel: str) -> bool:
     return re.search(rf'(?<![\w$]){re.escape(rel)}(?![\w$])', sql, re.I) is not None
 
 
-def seed(conn, every: int | None, per: dict[str, int] | None = None, sql: str | None = None) -> list[Seeded]:
+STATS = """
+select n.nspname || '.' || c.relname,
+       case when c.relkind = 'p' then (select coalesce(sum(greatest(l.reltuples, 0)), 0) from pg_partition_tree(c.oid) t
+                                       join pg_class l on l.oid = t.relid where t.isleaf)
+            else greatest(c.reltuples, 0) end::bigint
+from pg_class c join pg_namespace n on n.oid = c.relnamespace
+where c.relkind in ('r', 'p') and not c.relispartition
+  and n.nspname not in ('pg_catalog', 'information_schema') and n.nspname not like 'pg_toast%'
+"""
+
+
+def counts_from(dsn: str) -> dict[str, int]:
+    """Row estimates per table from another database's statistics (pg_class.reltuples), read in a read-only session.
+
+    This is what the planner already keeps: no table is scanned and nothing is written."""
+    import psycopg
+
+    with psycopg.connect(dsn) as c:
+        c.read_only = True
+        return {name: n for name, n in c.execute(STATS).fetchall() if n > 0}
+
+
+def seed(conn, every: int | None, per: dict[str, int] | None = None, sql: str | None = None,
+         sizes: dict[str, int] | None = None) -> list[Seeded]:
     """Fill empty tables of the database behind `conn` (a SCRATCH database) and return one line per table.
 
-    `every` rows go to the tables `sql` names (all tables when it is None) and to the tables they reference, so a
-    foreign key has rows to point at; `per` sets a count for a table by name, wherever it is."""
-    per = per or {}
-    if not every and not per:
+    The tables `sql` names (all tables when it is None) and the tables they reference get their count from `sizes`
+    (by schema.table, as `counts_from` returns them), else `every`; `per` sets a count for a table wherever it is."""
+    per, sizes = per or {}, sizes or {}
+    if not every and not per and not sizes:
         return []
     conn.autocommit = True
     tables = {oid: (qname, name, rel) for oid, qname, name, rel in conn.execute(TABLES).fetchall()}
@@ -165,7 +188,7 @@ def seed(conn, every: int | None, per: dict[str, int] | None = None, sql: str | 
                 stack.append(parent)
     want = {}
     for oid, (_, name, rel) in tables.items():
-        n = per.get(name, per.get(rel, every if oid in targets else None))
+        n = per.get(name, per.get(rel, sizes.get(name, every) if oid in targets else None))
         if n:
             want[oid] = n
     enum_first = {oid: conn.execute("select quote_literal(enumlabel) from pg_enum where enumtypid = %s "

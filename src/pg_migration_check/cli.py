@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from .check import LOCKS, check, held_until_commit
-from .seed import parse_rows, seed
+from .seed import counts_from, parse_rows, seed
 from .seed import report as seed_report
 
 MARK = {"danger": "DANGER", "warn": "warn  ", "info": "info  "}
@@ -54,11 +54,14 @@ def main(argv=None) -> int:
     p.add_argument("-v", "--verbose", action="store_true", help="also show brief locks (info)")
     p.add_argument("--rows", action="append", metavar="[TABLE=]N", help="first fill the empty tables the files name, and the "
                    "tables they reference, with N synthetic rows so lock times are real (TABLE=N for one table)")
+    p.add_argument("--rows-from", metavar="DSN", help="take each table's row count for --rows from this database's "
+                   "statistics, read only (production is fine: no table is scanned)")
     a = p.parse_args(argv)
     try:
         every, per = parse_rows(a.rows)
     except ValueError as e:
         p.error(str(e))
+    sizes = counts_from(a.rows_from) if a.rows_from else None
     if not a.dsn:
         p.error("give --dsn or set DATABASE_URL (a scratch database: the migration is applied)")
     import psycopg
@@ -67,7 +70,7 @@ def main(argv=None) -> int:
     rank = {"info": 0, "warn": 1, "danger": 2}
     all_out = []
     with psycopg.connect(a.dsn) as conn:
-        seeded = seed(conn, every, per, "\n".join(Path(f).read_text(encoding="utf-8") for f in a.files))
+        seeded = seed(conn, every, per, "\n".join(Path(f).read_text(encoding="utf-8") for f in a.files), sizes)
         if seeded:
             out = sys.stderr if a.json else sys.stdout
             out.write("Before the migration:\n")
