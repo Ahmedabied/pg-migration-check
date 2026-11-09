@@ -77,3 +77,11 @@ def test_refuses_a_scratch_database_that_is_not_empty(project, dsn):
         c.execute("create table leftover (id int)")
     with pytest.raises(CommandError, match="not empty"):
         run("--dsn", dsn, "--all")
+
+
+def test_rows_fill_the_tables_before_the_unapplied_migrations(project, dsn):
+    code, out = run("--dsn", dsn, "--rows", "30000", "--rows", "shop_note=0")
+    filled = out.index("Before shop.0002_widen_qty_and_index:\n  ")
+    assert "filled public.shop_order with 30,000 rows" in out[filled:].split("\n\n")[0]
+    assert "on public.shop_order (30,000 rows)" in out[filled:].split("shop.0003_note")[0]
+    assert code == 1

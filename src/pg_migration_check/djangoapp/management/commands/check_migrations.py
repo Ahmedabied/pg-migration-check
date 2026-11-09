@@ -17,6 +17,8 @@ from django.db.migrations.executor import MigrationExecutor
 
 from pg_migration_check.check import check
 from pg_migration_check.cli import report
+from pg_migration_check.seed import parse_rows, seed
+from pg_migration_check.seed import report as seed_report
 
 RANK = {"info": 0, "warn": 1, "danger": 2}
 
@@ -33,6 +35,9 @@ class Command(BaseCommand):
         parser.add_argument("--slow-ms", type=float, default=1000.0)
         parser.add_argument("--fail-on", choices=["danger", "warn", "never"], default="danger")
         parser.add_argument("-V", "--show-info", action="store_true", help="also show brief locks (info)")
+        parser.add_argument("--rows", action="append", metavar="[TABLE=]N",
+                            help="before each reported migration, fill the empty tables it names, and the tables they "
+                                 "reference, with N synthetic rows so lock times are real (TABLE=N for one table)")
 
     def handle(self, *args, **o):
         connection = connections[o["database"]]
@@ -40,6 +45,10 @@ class Command(BaseCommand):
             raise CommandError(f"the {o['database']!r} database is {connection.vendor}; this checks Postgres migrations")
         if not o["dsn"]:
             raise CommandError("give --dsn (or set PGMC_SCRATCH_DSN): an empty scratch database, it gets changed")
+        try:
+            every, per = parse_rows(o["rows"])
+        except ValueError as e:
+            raise CommandError(str(e))
         executor = MigrationExecutor(connection)
         applied = set(executor.loader.applied_migrations)
         plan = executor.migration_plan(executor.loader.graph.leaf_nodes(), clean_start=True)
@@ -55,8 +64,13 @@ class Command(BaseCommand):
             for migration, _ in plan:
                 key = (migration.app_label, migration.name)
                 sql = "\n".join(collect_sql([(migration, False)]))
-                results = check(conn, sql, o["slow_ms"])
                 shown = (o["all"] or key not in applied) and o["app_label"] in (None, migration.app_label)
+                if shown:  # tables made by earlier migrations get their rows now; filled ones are left alone
+                    fresh = [x for x in seed(conn, every, per, sql) if x.skipped != "already has rows"]
+                    if fresh:
+                        self.stdout.write(f"\nBefore {migration.app_label}.{migration.name}:\n")
+                        seed_report(fresh, self.stdout)
+                results = check(conn, sql, o["slow_ms"])
                 failed = next((r for r in results if r.error), None)
                 if shown:
                     reported += 1

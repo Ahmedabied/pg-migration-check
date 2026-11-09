@@ -74,7 +74,14 @@ python manage.py sqlmigrate shop 0042 > /tmp/0042.sql && pg-migration-check /tmp
 
 **The database gets changed**: the migration is applied. Point it at a CI service container or a copy, never at
 production. Options: `--fail-on danger|warn|never`, `--slow-ms` (ACCESS EXCLUSIVE held this long is a danger,
-default 1000), `--json`, `-v` to show brief locks too.
+default 1000), `--json`, `-v` to show brief locks too, and `--rows N` (below).
+
+**`--rows N` gives an empty scratch database production's weight.** Before the migration runs, every empty table
+it names, and every table those reference, gets N synthetic rows from one `INSERT ... SELECT` over
+`generate_series`: a value per column type (numbers, text inside `varchar(n)`, `numeric(p, s)` inside its
+precision, uuid, dates, json, enums, arrays), foreign keys pointing at real parent rows, sequences moved past them.
+`--rows orders=5000000` sets one table. Tables that already hold rows are left alone; a table it cannot fill (a
+CHECK its values break, a unique boolean) is reported and skipped, never half filled.
 
 ## In a Django project
 
@@ -102,6 +109,17 @@ warnings worth knowing before you copy their patterns onto a big table: 13 migra
 keys or checks added without `NOT VALID` (checked against every row while writes wait), 1 column drop, and 1 index
 built without `CONCURRENTLY` (`sites.0002`).
 
+The same command on this repository's test app with `--rows 1000000` (Postgres 16.2): `shop_order` filled in 1.7 s,
+then `shop.0002` (an int to bigint `AlterField` and an `AddIndex`) shows what an empty scratch database hid:
+
+| | empty tables (two runs) | `--rows 1000000` (one run) |
+|---|---|---|
+| rewrite, ACCESS EXCLUSIVE (reads and writes wait) | 4 to 17 ms | 613 ms |
+| index build, SHARE (writes wait) | 1 to 20 ms | 1,369 ms |
+| held until Django's one transaction commits | 18 to 24 ms | 1,982 ms |
+
+Run with `python manage.py check_migrations --rows 1000000 --dsn ...`. 3.8 s from start to report.
+
 ## In GitHub Actions
 
 ```yaml
@@ -120,8 +138,8 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ## Limits
 
-- **Lock time is measured on your scratch data.** Fill the scratch tables with a realistic number of rows, or read
-  the times as "per this many rows" and scale.
+- **Lock time is measured on your scratch data and hardware.** `--rows` gives the tables a production-like row count,
+  but the rows are uniform and narrow, indexes are fresh and nothing else runs: read the times as a floor.
 - **It cannot see lock waits.** On a busy production table a migration first waits for running queries; that wait is
   the classic outage, and the reason for `lock_timeout`, which it checks for.
 - **One statement per transaction.** Django wraps a migration in one transaction; the summary line adds up how long
@@ -134,7 +152,7 @@ This repository's own CI runs the tests and both examples on Postgres 14, 16 and
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 17 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 25 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
 ```
 
 Built with AI pair programming.
