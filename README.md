@@ -260,7 +260,7 @@ on both examples with `rollback`.
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 106 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
+pytest -q            # 106 tests on a real Postgres (one skips below 18; pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
 ```
 
 Built with AI pair programming.
