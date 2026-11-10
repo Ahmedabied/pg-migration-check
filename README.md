@@ -75,13 +75,14 @@ newer, and flags a `NOT NULL` constraint added without `NOT VALID`, which reads 
 
 ## Measured: what it catches
 
-[tests/test_corpus.py](tests/test_corpus.py) holds 24 risky migration patterns, the kind that tools like
+[tests/test_corpus.py](tests/test_corpus.py) holds 26 risky migration patterns, the kind that tools like
 strong_migrations and squawk document, written fresh here, and 14 safe forms of the same changes. Each runs on its
 own copy of a seeded database. On 500,000 rows (Postgres 18.6, default `--slow-ms`), version 0.3.1 flagged 16 of the
-24 and kept 12 of the 14 safe forms quiet. 0.4.0 flags all 24 and keeps all 14 quiet.
+26 and kept 12 of the 14 safe forms quiet. 0.4.0 flagged 24 and kept all 14 quiet. 0.4.2 flags all 26.
 
 What 0.3.1 missed: a renamed table (its findings were dropped, because the table no longer had the name it was
-live under), an UPDATE backfill of a third of the table (1.6 s, no finding) and a DELETE of old rows, `CREATE INDEX
+live under), an UPDATE backfill of a third of the table (1.6 s, no finding, written plainly, with `WITH` or in a
+`DO` block; 0.4.0 still missed the last two) and a DELETE of old rows, `CREATE INDEX
 CONCURRENTLY` between `BEGIN` and `COMMIT` (Postgres refuses it; the tool ran it on its own), `VACUUM FULL` (an
 error: it was run inside a transaction), `DROP TABLE`, an enum value rename, and a `PRIMARY KEY` added on 500,000
 rows (84 ms, so only info). It also raised one false alarm: `REFRESH MATERIALIZED VIEW CONCURRENTLY` takes
