@@ -33,8 +33,9 @@ savepoint of one transaction with `--rollback`), and before it commits the tool 
 - **which locks it holds**, from `pg_locks` for its own backend, mapped to what each mode blocks;
 - **whether a table was rewritten**, because its `relfilenode` changed;
 - **how long it took**, which is how long those locks were held, on the rows you put in the scratch database;
-- **how many rows an UPDATE or DELETE changed**: 10,000 or more in one transaction is a backfill that wants
-  batches, since every changed row stays locked until it commits.
+- **how many rows it updated or deleted in each table**, from Postgres's own counters for the transaction, so a
+  backfill counts however it is written (`WITH`, a `DO` block, a cascade): 10,000 or more in one transaction is a
+  backfill that wants batches, since every changed row stays locked until it commits.
 
 A few risks the locks cannot show are read from the SQL: renames of columns, tables and enum values and dropped
 columns and tables (they break code that is still running), `SET NOT NULL` without a validated `CHECK` (on
@@ -214,7 +215,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: psql "$DSN" -f schema.sql      # your schema and some rows: lock time depends on them
-      - uses: Ahmedabied/pg-migration-check@v0.4.1
+      - uses: Ahmedabied/pg-migration-check@v0.4.2
         with:
           files: migrations/new/*.sql
           dsn: ${{ env.DSN }}
@@ -240,9 +241,10 @@ on both examples with `rollback`.
 - **`--rows` picks tables by name.** A table is filled when its name appears as a word anywhere in the migration's
   SQL, so a table called like a common column (`name`, `email`) can be filled without being touched. Harmless, but
   at a million rows it costs seconds; `--rows that_table=0` turns it off.
-- **Backfills are seen by their row count and time.** An `UPDATE` or `DELETE` that changes 10,000 rows or more,
-  or takes a tenth of `--slow-ms`, is a warning. A backfill written as `WITH ... UPDATE`, or as a loop in a
-  function, is not recognised. Under `--rollback`, `VACUUM` is reported from its text and not run.
+- **A backfill is judged one statement at a time.** 10,000 rows or more updated or deleted by one statement, or a
+  tenth of `--slow-ms`, is a warning. Smaller statements in one transaction are not added up, though in an atomic
+  Django migration their row locks are all held until it commits. Under `--rollback`, `VACUUM` is reported from its
+  text and not run.
 - **SQL files and Django.** Django has its own command (above); other frameworks need their SQL output. In Django,
   data migrations (`RunPython`) are not run on the scratch database, so a later migration that needs their data fails
   there.
@@ -257,7 +259,7 @@ on both examples with `rollback`.
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 101 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
+pytest -q            # 104 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
 ```
 
 Built with AI pair programming.

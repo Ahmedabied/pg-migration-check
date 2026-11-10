@@ -44,6 +44,9 @@ FLAG = [
     ("SET NOT NULL", "alter table orders alter column email set not null"),
     ("backfill with UPDATE", "update orders set status = 'open' where status is null"),
     ("delete old rows", "delete from orders where created_at < now() - interval '1 year'"),
+    ("a backfill written as WITH ... UPDATE", "with todo as (select id from orders where status is null)"
+                                             " update orders set status = 'open' from todo where orders.id = todo.id"),
+    ("a backfill in a DO block", "do $$ begin update orders set status = 'open' where status is null; end $$"),
     ("CONCURRENTLY inside BEGIN and COMMIT",
      "begin; create index concurrently orders_created_idx on orders (created_at); commit;"),
     ("VACUUM FULL", "vacuum full orders"),
@@ -138,7 +141,7 @@ def test_a_materialized_view_refreshed_concurrently_blocks_no_reader(server_uri,
 
 def test_a_backfill_names_its_rows_and_a_small_batch_is_only_info(server_uri, template):
     errors, loud = verdict(server_uri, template, "update orders set status = 'open' where status is null", slow_ms=1e12)
-    assert any(t.startswith("UPDATE changes 33,333 rows of public.orders in one transaction") for t in loud), loud
+    assert any(t.startswith("updates 33,333 rows of public.orders in one transaction") for t in loud), loud
     name = "case_" + uuid.uuid4().hex[:8]
     with psycopg.connect(server_uri, autocommit=True) as c:
         c.execute(f"create database {name} template {template}")
@@ -149,7 +152,7 @@ def test_a_backfill_names_its_rows_and_a_small_batch_is_only_info(server_uri, te
         with psycopg.connect(server_uri, autocommit=True) as c:
             c.execute(f"drop database {name} with (force)")
     [(level, text)] = [(f.level, f.text) for r in results for f in r.findings]
-    assert level == "info" and text.startswith("DELETE removes 500 rows of public.orders in one transaction"), text
+    assert level == "info" and text.startswith("deletes 500 rows of public.orders in one transaction"), text
 
 
 def test_vacuum_full_under_rollback_is_reported_not_run(server_uri, template):
@@ -201,3 +204,19 @@ def test_concurrently_in_a_file_that_runs_as_one_transaction_is_a_danger(server_
                 c.execute(f"drop database {name} with (force)")
         dangers = [f.text for r in results for f in r.findings if f.level == "danger"]
         assert bool(dangers) is want and all(t.startswith("Postgres refuses this inside a transaction") for t in dangers)
+
+
+def test_rows_a_cascade_deletes_are_counted_on_its_table_under_rollback_too(dsn):
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("create table parent (id bigint primary key)")
+        c.execute("insert into parent select generate_series(1, 30000)")
+        c.execute("create table child (id bigint primary key, parent_id bigint references parent on delete cascade)")
+        c.execute("insert into child select g, g from generate_series(1, 30000) g")
+    with psycopg.connect(dsn) as conn:
+        with conn.transaction(force_rollback=True):
+            results = check(conn, "set lock_timeout = '2s'; update parent set id = id where id <= 12000;"
+                                  " delete from parent where id <= 20000", rollback=True, slow_ms=1e12)
+    update, delete = results[1], results[2]
+    assert update.changed == {"public.parent": (12000, 0)}  # its own count, not the transaction's so far
+    assert delete.changed == {"public.parent": (0, 20000), "public.child": (0, 20000)}
+    assert sum(f.level == "warn" for f in delete.findings) == 2
