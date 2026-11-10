@@ -40,6 +40,13 @@ running), `SET NOT NULL` without a validated `CHECK` (on Postgres 18 it suggests
 Tables created earlier in the same file are skipped: nothing live uses them yet (with `--rollback`, only until
 the file has locked a live table; after that the SQL rules still speak about the new tables too).
 
+One finding comes from comparing what the statement said with what it did. `CREATE INDEX IF NOT EXISTS` on a name
+that is already there builds nothing, and still takes its `SHARE` lock, because Postgres locks the table before it
+looks for the name. In a schema file that is run on every deploy, that statement waits behind any open transaction
+that wrote to the table, and writes queue behind it. The report says so and gives the form that takes no lock
+(`to_regclass()` first, in a `DO` block). It was added after the checker found exactly that in
+[outbox-relay](https://github.com/Ahmedabied/outbox-relay)'s own schema file.
+
 ## Measured: lock time on a 1M row table
 
 `python bench/bench.py`, Postgres 16.2 on an Intel i5-14400F, a fresh copy of the table for every case:
@@ -215,11 +222,17 @@ on both examples with `rollback`.
   data migrations (`RunPython`) are not run on the scratch database, so a later migration that needs their data fails
   there.
 
+## Related
+
+- [outbox-relay](https://github.com/Ahmedabied/outbox-relay) moves events from a Postgres outbox table to Kafka
+  without losing or reordering them. Its schema file was run through this checker on a table of 500,000 rows; the
+  locks it reported are why that `init` now takes none on a table that needs no change.
+
 ## Development
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 56 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 11 s
+pytest -q            # 57 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 11 s
 ```
 
 Built with AI pair programming.

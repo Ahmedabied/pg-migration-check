@@ -47,6 +47,22 @@ def test_index_without_concurrently_blocks_writes(conn):
     assert any("CONCURRENTLY" in f.text for f in r.findings)
 
 
+def test_create_index_if_not_exists_on_an_index_that_is_there_builds_nothing_but_still_locks(conn):
+    conn.execute("create index orders_email_idx on orders (email)")
+    (r,) = [x for x in check(conn, "create index if not exists orders_email_idx on orders (email)") if x.n]
+    assert r.locks["public.orders"] == "ShareLock"  # taken before Postgres looks for the name
+    texts = [f.text for f in r.findings]
+    assert any("already exists" in t and "to_regclass" in t for t in texts)
+    assert not any("for the whole build" in t for t in texts)  # nothing was built this time
+    (r,) = [x for x in check(conn, "create index if not exists orders_qty_idx on orders (qty)") if x.n]  # a new one
+    texts = [f.text for f in r.findings]
+    assert any("for the whole build" in t for t in texts) and not any("already exists" in t for t in texts)
+    guarded = ("do $$ begin if to_regclass('orders_email_idx') is null then "
+               "create index orders_email_idx on orders (email); end if; end $$")
+    (r,) = [x for x in check(conn, guarded) if x.n]
+    assert r.locks == {} and r.findings == []  # the form the warning suggests: no lock when there is nothing to do
+
+
 def test_concurrent_index_runs_outside_a_transaction(conn):
     res = check(conn, "create index concurrently orders_email on orders (email)")
     (r,) = [x for x in res if x.n]

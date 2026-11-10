@@ -1,6 +1,8 @@
 name: ci
 on:
   push:
+    branches: [main]
+    tags: ['v*']  # the action is used by tag, so a tag is checked too
   pull_request:
 permissions:
   contents: read

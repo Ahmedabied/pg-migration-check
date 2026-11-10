@@ -144,6 +144,13 @@ def text_rules(sql: str, server_version: int = 0) -> list[Finding]:
     return f
 
 
+# CREATE INDEX IF NOT EXISTS on a name that is taken. Seen on a schema file meant to be run on every deploy: behind
+# one open transaction it waited, and the application's inserts waited behind it.
+ALREADY_THERE = ("the index already exists, so nothing was built, but CREATE INDEX IF NOT EXISTS takes its lock before "
+                 "it looks. Every run waits for any open transaction that wrote to the table, and writes queue behind "
+                 "it. To take no lock when there is nothing to do, look first: DO $$ BEGIN IF to_regclass('index_name') "
+                 "IS NULL THEN CREATE INDEX ...; END IF; END $$.")
+
 # A table or index name as written: maybe schema-qualified, maybe quoted.
 NAME = r'((?:"[^"]+"|[\w$]+)(?:\s*\.\s*(?:"[^"]+"|[\w$]+))?)'
 
@@ -297,6 +304,11 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
                         new = after.get(oid)
                         if new and new[3] != old[3] and old[2] in ("r", "m"):  # a new file: the table was copied
                             r.rewritten.append(old[1])
+                    if re.match(r"CREATE (UNIQUE )?INDEX IF NOT EXISTS\b", s) and not any(
+                            oid not in before and row[2] in ("i", "I") for oid, row in after.items()):
+                        # No new index came out of it: the name was there. Nothing was built, the lock was still taken.
+                        r.findings = [f for f in r.findings if not f.text.startswith("CREATE INDEX without CONCURRENTLY")]
+                        r.findings.append(Finding("warn", ALREADY_THERE))
                     r.locks = {t: m for t, m in r.locks.items() if t in live}
                     r.rewritten = [t for t in r.rewritten if t in live]
                     r.rows = {names[o]: int(max(before[o][4], 0)) for o in before if names[o] in r.locks}
