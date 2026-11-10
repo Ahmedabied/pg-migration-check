@@ -450,6 +450,18 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False, one_t
         for t in r.rewritten:
             r.findings.insert(0, Finding("danger", f"rewrites {t}: the whole table is copied while it is locked"))
         results.append(r)
+    # Statements that run in one transaction keep every row they changed locked until it commits: small batches
+    # there add up to one backfill. Said once per table, when no single statement already said it.
+    totals: dict[str, list[int]] = {}
+    for r in results:
+        if r.n and in_block[r.n - 1]:
+            for t, (upd, dele) in r.changed.items():
+                totals.setdefault(t, []).append(upd + dele)
+    for t, counts in totals.items():
+        if len(counts) > 1 and sum(counts) >= BATCH_ROWS and max(counts) < BATCH_ROWS:
+            results.append(Result(0, "", findings=[Finding("warn", f"{len(counts)} statements in one transaction update "
+                f"or delete {sum(counts):,} rows of {t}: every one stays locked until it commits, as in one backfill. "
+                f"Commit each batch on its own (Django: a data migration with atomic = False).")]))
     if stmts and "LOCK_TIMEOUT" not in _norm(sql) and any(LOCKS.get(m, (0,))[0] >= BLOCKS_WRITES for r in results for m in r.locks.values()):
         results.append(Result(0, "", findings=[Finding("warn", "no lock_timeout: if a long query holds the table, this "
             "migration waits for it, and every query that arrives after waits behind the migration. Start with "

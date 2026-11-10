@@ -216,7 +216,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: psql "$DSN" -f schema.sql      # your schema and some rows: lock time depends on them
-      - uses: Ahmedabied/pg-migration-check@v0.4.2
+      - uses: Ahmedabied/pg-migration-check@v0.4.3
         with:
           files: migrations/new/*.sql
           dsn: ${{ env.DSN }}
@@ -242,10 +242,10 @@ on both examples with `rollback`.
 - **`--rows` picks tables by name.** A table is filled when its name appears as a word anywhere in the migration's
   SQL, so a table called like a common column (`name`, `email`) can be filled without being touched. Harmless, but
   at a million rows it costs seconds; `--rows that_table=0` turns it off.
-- **A backfill is judged one statement at a time.** 10,000 rows or more updated or deleted by one statement, or a
-  tenth of `--slow-ms`, is a warning. Smaller statements in one transaction are not added up, though in an atomic
-  Django migration their row locks are all held until it commits. Under `--rollback`, `VACUUM` is reported from its
-  text and not run.
+- **A backfill is judged by its rows and time.** 10,000 rows or more updated or deleted by one statement, or a
+  tenth of `--slow-ms`, is a warning; so are smaller statements that add up to that inside one transaction (between
+  `BEGIN` and `COMMIT`, or an atomic Django migration). In a plain file with no `BEGIN`, each statement is taken to
+  commit on its own. Under `--rollback`, `VACUUM` is reported from its text and not run.
 - **SQL files and Django.** Django has its own command (above); other frameworks need their SQL output. In Django,
   data migrations (`RunPython`) are not run on the scratch database, so a later migration that needs their data fails
   there.
@@ -260,7 +260,7 @@ on both examples with `rollback`.
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 104 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
+pytest -q            # 106 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
 ```
 
 Built with AI pair programming.

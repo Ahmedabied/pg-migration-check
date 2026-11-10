@@ -220,3 +220,36 @@ def test_rows_a_cascade_deletes_are_counted_on_its_table_under_rollback_too(dsn)
     assert update.changed == {"public.parent": (12000, 0)}  # its own count, not the transaction's so far
     assert delete.changed == {"public.parent": (0, 20000), "public.child": (0, 20000)}
     assert sum(f.level == "warn" for f in delete.findings) == 2
+
+
+def test_small_batches_in_one_transaction_add_up_to_a_backfill(server_uri, template):
+    batches = "delete from orders where id <= 6000; delete from orders where id between 6001 and 12000"
+    for sql, one, want in ((batches, True, True), (batches, False, False), ("begin; " + batches + "; commit", False, True)):
+        name = "case_" + uuid.uuid4().hex[:8]
+        with psycopg.connect(server_uri, autocommit=True) as c:
+            c.execute(f"create database {name} template {template}")
+        try:
+            with psycopg.connect(psycopg.conninfo.make_conninfo(server_uri, dbname=name)) as conn:
+                results = check(conn, "set lock_timeout = '2s'; " + sql, slow_ms=1e12, one_transaction=one)
+        finally:
+            with psycopg.connect(server_uri, autocommit=True) as c:
+                c.execute(f"drop database {name} with (force)")
+        loud = [f.text for r in results for f in r.findings if f.level == "warn"]
+        assert loud == (["2 statements in one transaction update or delete 12,000 rows of public.orders: every one "
+                         "stays locked until it commits, as in one backfill. Commit each batch on its own (Django: a "
+                         "data migration with atomic = False)."] if want else []), (sql, one, loud)
+
+
+def test_a_batch_already_too_big_is_said_once_not_twice(server_uri, template):
+    name = "case_" + uuid.uuid4().hex[:8]
+    with psycopg.connect(server_uri, autocommit=True) as c:
+        c.execute(f"create database {name} template {template}")
+    try:
+        with psycopg.connect(psycopg.conninfo.make_conninfo(server_uri, dbname=name)) as conn:
+            results = check(conn, "set lock_timeout = '2s'; delete from orders where id <= 15000;"
+                                  " delete from orders where id between 15001 and 16000", slow_ms=1e12, one_transaction=True)
+    finally:
+        with psycopg.connect(server_uri, autocommit=True) as c:
+            c.execute(f"drop database {name} with (force)")
+    loud = [f.text for r in results for f in r.findings if f.level == "warn"]
+    assert len(loud) == 1 and loud[0].startswith("deletes 15,000 rows of public.orders in one transaction"), loud
