@@ -32,11 +32,16 @@ savepoint of one transaction with `--rollback`), and before it commits the tool 
 
 - **which locks it holds**, from `pg_locks` for its own backend, mapped to what each mode blocks;
 - **whether a table was rewritten**, because its `relfilenode` changed;
-- **how long it took**, which is how long those locks were held, on the rows you put in the scratch database.
+- **how long it took**, which is how long those locks were held, on the rows you put in the scratch database;
+- **how many rows an UPDATE or DELETE changed**: 10,000 or more in one transaction is a backfill that wants
+  batches, since every changed row stays locked until it commits.
 
-A few risks the locks cannot show are read from the SQL: renames and dropped columns (they break code that is still
-running), `SET NOT NULL` without a validated `CHECK` (on Postgres 18 it suggests a `NOT NULL` constraint added
-`NOT VALID` instead), constraints added without `NOT VALID` (`NOT NULL` ones too), and no `lock_timeout`.
+A few risks the locks cannot show are read from the SQL: renames of columns, tables and enum values and dropped
+columns and tables (they break code that is still running), `SET NOT NULL` without a validated `CHECK` (on
+Postgres 18 it suggests a `NOT NULL` constraint added `NOT VALID` instead), constraints added without `NOT VALID`
+(`NOT NULL` ones too), a `PRIMARY KEY` or `UNIQUE` added without `USING INDEX`, `REINDEX` without `CONCURRENTLY`,
+a statement Postgres refuses inside a transaction block (`CONCURRENTLY`, `VACUUM`) between `BEGIN` and `COMMIT`,
+as Django's `sqlmigrate` writes them for an atomic migration, and no `lock_timeout`.
 Tables created earlier in the same file are skipped: nothing live uses them yet (with `--rollback`, only until
 the file has locked a live table; after that the SQL rules still speak about the new tables too).
 
@@ -66,6 +71,21 @@ Postgres 18 has a shorter way to make a column NOT NULL: `ADD CONSTRAINT name NO
 `VALIDATE CONSTRAINT`. On 18.6, same machine and table, that blocked for 0.1 ms (whole step 38 ms) against 41 ms
 for `SET NOT NULL`, and leaves no `CHECK` behind to drop. pg-migration-check suggests it when the server is 18 or
 newer, and flags a `NOT NULL` constraint added without `NOT VALID`, which reads every row under ACCESS EXCLUSIVE.
+
+## Measured: what it catches
+
+[tests/test_corpus.py](tests/test_corpus.py) holds 24 risky migration patterns, the kind that tools like
+strong_migrations and squawk document, written fresh here, and 14 safe forms of the same changes. Each runs on its
+own copy of a seeded database. On 500,000 rows (Postgres 18.6, default `--slow-ms`), version 0.3.1 flagged 16 of the
+24 and kept 12 of the 14 safe forms quiet. 0.4.0 flags all 24 and keeps all 14 quiet.
+
+What 0.3.1 missed: a renamed table (its findings were dropped, because the table no longer had the name it was
+live under), an UPDATE backfill of a third of the table (1.6 s, no finding) and a DELETE of old rows, `CREATE INDEX
+CONCURRENTLY` between `BEGIN` and `COMMIT` (Postgres refuses it; the tool ran it on its own), `VACUUM FULL` (an
+error: it was run inside a transaction), `DROP TABLE`, an enum value rename, and a `PRIMARY KEY` added on 500,000
+rows (84 ms, so only info). It also raised one false alarm: `REFRESH MATERIALIZED VIEW CONCURRENTLY` takes
+EXCLUSIVE, which blocks nothing a reader of a materialized view does. In CI the risky patterns run with timing
+switched off, so each catch comes from a rewrite, the SQL or a row count, and holds at any table size.
 
 ## Run it in under a minute
 
@@ -192,7 +212,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: psql "$DSN" -f schema.sql      # your schema and some rows: lock time depends on them
-      - uses: Ahmedabied/pg-migration-check@v0.3.1
+      - uses: Ahmedabied/pg-migration-check@v0.4.0
         with:
           files: migrations/new/*.sql
           dsn: ${{ env.DSN }}
@@ -218,6 +238,9 @@ on both examples with `rollback`.
 - **`--rows` picks tables by name.** A table is filled when its name appears as a word anywhere in the migration's
   SQL, so a table called like a common column (`name`, `email`) can be filled without being touched. Harmless, but
   at a million rows it costs seconds; `--rows that_table=0` turns it off.
+- **Backfills are seen by their row count and time.** An `UPDATE` or `DELETE` that changes 10,000 rows or more,
+  or takes a tenth of `--slow-ms`, is a warning. A backfill written as `WITH ... UPDATE`, or as a loop in a
+  function, is not recognised. Under `--rollback`, `VACUUM` is reported from its text and not run.
 - **SQL files and Django.** Django has its own command (above); other frameworks need their SQL output. In Django,
   data migrations (`RunPython`) are not run on the scratch database, so a later migration that needs their data fails
   there.
@@ -232,7 +255,7 @@ on both examples with `rollback`.
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 57 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 11 s
+pytest -q            # 99 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
 ```
 
 Built with AI pair programming.

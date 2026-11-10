@@ -57,6 +57,8 @@ class Result:
     findings: list[Finding] = field(default_factory=list)
     error: str | None = None
     concurrently: bool = False
+    changed: dict[str, int] = field(default_factory=dict)  # table -> rows an UPDATE or DELETE changed
+    outside: bool = False  # VACUUM: cannot run in a transaction block either
 
 
 def split(sql: str) -> list[str]:
@@ -123,6 +125,13 @@ def text_rules(sql: str, server_version: int = 0) -> list[Finding]:
     if re.search(r"\bRENAME\s+COLUMN\b|\bALTER\s+TABLE\b.*\bRENAME\s+(?!CONSTRAINT)\b(TO\b|\w+\s+TO\b)", s):
         f.append(Finding("danger", "rename: code still running with the old name breaks the moment this commits. "
                                    "Add the new name, deploy code that uses it, then drop the old one."))
+    if re.search(r"\bALTER\s+TYPE\b.*\bRENAME\s+VALUE\b", s):
+        f.append(Finding("danger", "renaming an enum value: rows keep their value under the new label, so code still "
+                                   "writing the old one fails (invalid input value for enum) the moment this commits. "
+                                   "Add the new value, deploy code that writes it, move the rows in batches, and keep "
+                                   "the old label until nothing uses it."))
+    if re.match(r"DROP\s+TABLE\b", s):
+        f.append(Finding("warn", "drop table: deploy code that no longer reads or writes it first."))
     if re.search(r"\bDROP\s+COLUMN\b", s):
         f.append(Finding("warn", "drop column: deploy code that no longer reads or writes it first "
                                  "(Django: remove the field from the model in an earlier release)."))
@@ -138,6 +147,14 @@ def text_rules(sql: str, server_version: int = 0) -> list[Finding]:
     if re.search(r"\bADD\s+(CONSTRAINT\s+\S+\s+)?(FOREIGN\s+KEY|CHECK)\b", s) and "NOT VALID" not in s:
         f.append(Finding("warn", "a new FOREIGN KEY or CHECK is checked against every row while writes wait. "
                                  "Add it NOT VALID, then VALIDATE CONSTRAINT in a later step (that only blocks schema changes)."))
+    if re.search(r"\bADD\s+(CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|UNIQUE)\b", s) and "USING INDEX" not in s:
+        f.append(Finding("warn", "a new PRIMARY KEY or UNIQUE constraint builds its index under ACCESS EXCLUSIVE, so reads "
+                                 "and writes wait for the whole build. Build the index first with CREATE UNIQUE INDEX "
+                                 "CONCURRENTLY, then ADD CONSTRAINT name PRIMARY KEY (or UNIQUE) USING INDEX name. A "
+                                 "primary key also needs its columns NOT NULL: make them so the safe way first."))
+    if re.match(r"REINDEX\b", s) and not is_concurrent(sql):
+        f.append(Finding("warn", "REINDEX without CONCURRENTLY blocks writes to the table, and reads that use the index, "
+                                 "for the whole rebuild. Use REINDEX INDEX CONCURRENTLY (Postgres 12 and newer)."))
     if re.search(r"\bCREATE\s+(UNIQUE\s+)?INDEX\b", s) and "CONCURRENTLY" not in s:
         f.append(Finding("warn", "CREATE INDEX without CONCURRENTLY blocks writes for the whole build. "
                                  "Use CREATE INDEX CONCURRENTLY (Django: AddIndexConcurrently, atomic = False)."))
@@ -163,6 +180,35 @@ def is_concurrent(stmt: str) -> bool:
                          r"|REINDEX (\([^)]*\) )?(INDEX|TABLE|SCHEMA|DATABASE|SYSTEM) CONCURRENTLY\b"
                          r"|REINDEX \( ?([^)]*, ?)?CONCURRENTLY( TRUE| ON| 1)? ?(,[^)]*)?\)", s)
                 or re.match(r"ALTER TABLE .* DETACH PARTITION .* CONCURRENTLY$", s))
+
+
+# Changing this many rows in one transaction is a backfill that wants batches, however fast the scratch database is.
+BATCH_ROWS = 10_000
+DML = re.compile(r"\s*(UPDATE|DELETE\s+FROM)\s+(?:ONLY\s+)?" + NAME, re.I)
+NOT_IN_BLOCK = ("Postgres refuses this inside a transaction block, and this file runs it between BEGIN and COMMIT, so "
+                "the migration fails when it gets here (cannot run inside a transaction block). Run it outside the block "
+                "(Django: atomic = False on the migration).")
+
+
+def _vacuum(conn, stmt: str, live_tables: set[str]) -> tuple[bool, list[str]]:
+    """(FULL or not, the tables it works on) for a VACUUM, read from its text; no table named means all of them."""
+    m = re.match(r"\s*VACUUM\s*(?:\((?P<opts>[^)]*)\))?(?P<words>(?:\s*\b(?:FULL|FREEZE|VERBOSE|ANALYZE|ANALYSE)\b)*)"
+                 r"\s*(?P<rest>.*)$", stmt, re.I | re.S)
+    if not m:
+        return False, sorted(live_tables)
+    full = bool(re.search(r"\bFULL\b(?!\s*(?:FALSE|OFF|0)\b)", m.group("opts") or "", re.I)
+                or re.search(r"\bFULL\b", m.group("words") or "", re.I))
+    names = [n.strip() for n in re.sub(r"\([^)]*\)", "", m.group("rest")).split(",") if n.strip()]
+    return full, [_table_of(conn, n, False) for n in names] or sorted(live_tables)
+
+
+def _type_oid(conn, name: str) -> int | None:
+    try:
+        with conn.transaction():  # a savepoint under --rollback
+            row = conn.execute("select to_regtype(%s)::oid", (name,)).fetchone()
+    except Exception:
+        return None
+    return row[0] if row else None
 
 
 def _table_of(conn, name: str, index: bool) -> str:
@@ -241,11 +287,11 @@ ENDS_TRANSACTION = re.compile(r"(ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE TRANSA
 WRAPPER = re.compile(r"(BEGIN|COMMIT|START TRANSACTION|END)(\s+\w+)*")
 
 
-def _execute(conn, stmt: str) -> None:
+def _execute(conn, stmt: str) -> int:
     """Send one migration statement over the extended protocol, which refuses a string holding two commands, so a
     statement split() got wrong cannot carry a second one (a ROLLBACK under --rollback) past the checks. Asking for
     binary results is what selects that protocol: the simple one cannot return them."""
-    conn.execute(stmt, prepare=False, binary=True)
+    return conn.execute(stmt, prepare=False, binary=True).rowcount
 
 
 def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> list[Result]:
@@ -255,7 +301,13 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
     rollback=True: the caller has opened one transaction and rolls it back afterwards (cli --rollback). Each statement
     runs in a savepoint inside it and shows the locks it added; a lock an earlier statement took is still held and is
     not shown again. A CONCURRENTLY statement cannot run in a transaction, so its plain form is run to time it."""
-    stmts = [s for s in split(sql) if not WRAPPER.fullmatch(_norm(s))]
+    stmts, in_block, block = [], [], False
+    for s in split(sql):
+        if WRAPPER.fullmatch(_norm(s)):  # BEGIN ... COMMIT around the file: Django's sqlmigrate writes it
+            block = _norm(s).startswith(("BEGIN", "START"))
+            continue
+        stmts.append(s)
+        in_block.append(block)
     if rollback:
         ends = [s for s in stmts if ENDS_TRANSACTION.match(_norm(s))]
         if ends:
@@ -265,7 +317,14 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
     else:
         conn.autocommit = True
     results: list[Result] = []
-    live = {row[1] for row in conn.execute(SNAPSHOT).fetchall()}  # tables that exist before the file: live traffic
+    snapshot = conn.execute(SNAPSHOT).fetchall()
+    live = {row[1] for row in snapshot}  # tables that exist before the file: live traffic
+    live_oids = {row[0] for row in snapshot}  # the same tables, followed through a rename later in the file
+    kind = {row[1]: row[2] for row in snapshot}
+    live_tables = {name for name, k in kind.items() if k in ("r", "m")}
+    live_types = {row[0] for row in conn.execute(
+        "select t.oid from pg_type t join pg_namespace n on n.oid = t.typnamespace "
+        "where n.nspname not in ('pg_catalog', 'information_schema') and n.nspname not like 'pg_toast%'").fetchall()}
     for n, stmt in enumerate(stmts, 1):
         r = Result(n, stmt, findings=text_rules(stmt, conn.info.server_version))
         s = _norm(stmt)
@@ -273,10 +332,29 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
         if m and _set_not_null_skips_scan(conn, stmt):
             r.findings = [f for f in r.findings if not f.text.startswith("SET NOT NULL")]
         r.concurrently = is_concurrent(stmt)
+        r.outside = bool(re.match(r"VACUUM\b", s))
+        if in_block[n - 1] and (r.concurrently or r.outside):
+            r.findings.append(Finding("danger", NOT_IN_BLOCK))
         try:
             if re.match(r"SET\s+(LOCAL\s+)?(LOCK_TIMEOUT|STATEMENT_TIMEOUT)\b", s):
                 with conn.transaction():  # a plain SET outlives its transaction (or savepoint) and lasts the session
                     _execute(conn, stmt)
+            elif r.outside:  # VACUUM cannot run in a transaction block; FULL rewrites what it names
+                full, targets = _vacuum(conn, stmt, live_tables)
+                r.locks = {t: "AccessExclusiveLock" if full else "ShareUpdateExclusiveLock" for t in targets if t in live}
+                before = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
+                r.rows = {row[1]: int(max(row[4], 0)) for row in before.values() if row[1] in r.locks}
+                if rollback:
+                    r.rewritten = list(r.locks) if full else []
+                    r.findings.append(Finding("note", "VACUUM cannot run inside the rollback transaction, so it was not "
+                                                      "run" + ("; VACUUM FULL rewrites every table it works on" if full else "")))
+                else:
+                    t = time.perf_counter()
+                    _execute(conn, stmt)
+                    r.ms = (time.perf_counter() - t) * 1000
+                    after = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
+                    r.rewritten = [old[1] for oid, old in before.items() if old[1] in r.locks and old[2] in ("r", "m")
+                                   and oid in after and after[oid][3] != old[3]]
             elif r.concurrently and not rollback:  # cannot run in a transaction block; its locks are gone when it returns
                 locks = concurrent_locks(conn, stmt)
                 t = time.perf_counter()
@@ -285,15 +363,26 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
                 r.locks = locks
             else:
                 declared = concurrent_locks(conn, stmt) if r.concurrently else None
+                dml = DML.match(stmt)
+                target = _table_of(conn, dml.group(2), False) if dml else None
+                was_live_type = False
+                mt = re.match(r"\s*ALTER\s+TYPE\s+" + NAME, stmt, re.I)
+                if mt:
+                    was_live_type = _type_oid(conn, mt.group(1)) in live_types
                 with conn.transaction():  # a savepoint under --rollback
                     held_before = set(conn.execute(MY_LOCKS).fetchall())
                     before = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
                     t = time.perf_counter()
-                    _execute(conn, plain(stmt) if r.concurrently else stmt)
+                    changed = _execute(conn, plain(stmt) if r.concurrently else stmt)
                     r.ms = (time.perf_counter() - t) * 1000
                     held_all = conn.execute(MY_LOCKS).fetchall()
                     after = {row[0]: row for row in conn.execute(SNAPSHOT).fetchall()}
-                    names = {oid: row[1] for oid, row in {**before, **after}.items()}
+                    # the name before the statement: a table this renames is still the live one
+                    names = {oid: row[1] for oid, row in {**after, **before}.items()}
+                    renamed = {oid: row for oid, row in after.items() if oid in live_oids and row[1] not in live}
+                    live |= {row[1] for row in renamed.values()}  # later statements name it by its new name
+                    kind.update({row[1]: row[2] for row in renamed.values()})
+                    live_tables |= {row[1] for row in renamed.values() if row[2] in ("r", "m")}
                     tables = {oid for oid in names if after.get(oid, before.get(oid))[2] in ("r", "p", "m")}
                     for oid, mode in held_all:
                         if oid in tables and (oid, mode) not in held_before:  # what this statement added
@@ -312,8 +401,10 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
                     r.locks = {t: m for t, m in r.locks.items() if t in live}
                     r.rewritten = [t for t in r.rewritten if t in live]
                     r.rows = {names[o]: int(max(before[o][4], 0)) for o in before if names[o] in r.locks}
-                    if not any(names[oid] in live for oid, _ in held_all if oid in tables):
-                        r.findings = []  # only touched tables made by this file: no live traffic to hurt
+                    if target in live and changed > 0:
+                        r.changed[target] = changed
+                    if not was_live_type and not any(names[oid] in live for oid, _ in held_all if oid in tables):
+                        r.findings = []  # only touched tables (or a type) made by this file: no live traffic to hurt
                 if declared is not None:  # report what the real CONCURRENTLY statement takes, not the plain form
                     r.locks, r.rows, r.rewritten = declared, {}, []
                     r.findings.append(Finding("note", "timed without CONCURRENTLY inside the rollback transaction; "
@@ -332,6 +423,8 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
             rank, label, blocks = LOCKS.get(mode, (0, mode, "?"))
             if t not in existing or rank < BLOCKS_WRITES:
                 continue
+            if kind.get(t) == "m" and rank < 8:  # a materialized view takes no writes: only reads can be blocked
+                continue
             if rank == 8 and (r.ms >= slow_ms or t in r.rewritten):
                 level = "danger"
             elif r.ms >= slow_ms / 10:
@@ -339,6 +432,13 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
             else:
                 level = "info"  # brief; the risk is waiting in the lock queue, which lock_timeout covers
             r.findings.insert(0, Finding(level, f"{label} on {t} ({r.rows.get(t, 0):,} rows) for {r.ms:,.0f} ms: blocks {blocks}"))
+        for t, rows in r.changed.items():
+            level = "warn" if rows >= BATCH_ROWS or r.ms >= slow_ms / 10 else "info"
+            verb = "UPDATE changes" if _norm(stmt).startswith("UPDATE") else "DELETE removes"
+            r.findings.insert(0, Finding(level, f"{verb} {rows:,} rows of {t} in one transaction ({r.ms:,.0f} ms). "
+                f"Each stays locked until it commits, so other writes to those rows wait, and the table carries "
+                f"{rows:,} dead row versions until vacuum. Backfill in batches of a few thousand rows, each in its own "
+                f"transaction, in a step of its own after the schema change."))
         for t in r.rewritten:
             r.findings.insert(0, Finding("danger", f"rewrites {t}: the whole table is copied while it is locked"))
         results.append(r)
@@ -353,7 +453,7 @@ def held_until_commit(results: list[Result]) -> dict[str, float]:
     """If the whole migration runs in one transaction (Django's default), a lock taken by statement i is held until
     the end: the sum of the durations from i on. Returns table -> ms for locks that block writes."""
     out: dict[str, float] = {}
-    if any(r.concurrently for r in results):  # such a file cannot run in one transaction
+    if any(r.concurrently or r.outside for r in results):  # such a file cannot run in one transaction
         return out
     total_after = 0.0
     for r in reversed([r for r in results if r.n]):
