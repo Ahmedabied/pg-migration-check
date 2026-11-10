@@ -37,6 +37,14 @@ CASES = [
 ]
 
 
+# Postgres 18 can add a NOT NULL constraint NOT VALID and validate it later, so no CHECK is left to drop.
+PG18_CASES = [
+    ("make a column NOT NULL (Postgres 18)",
+     "alter table t alter column email set not null",
+     "alter table t add constraint t_email_nn not null email not valid; alter table t validate constraint t_email_nn"),
+]
+
+
 def ms(v: float) -> str:
     return f"{v:,.1f} ms" if v < 10 else f"{v:,.0f} ms"
 
@@ -82,7 +90,8 @@ def main() -> None:
                   "from generate_series(1, %s) g", (a.rows,))
         print(f"Postgres {version}, {a.rows:,} rows", file=sys.stderr)
         rows = []
-        for name, unsafe, safe in CASES:
+        cases = CASES + (PG18_CASES if c.info.server_version >= 180000 else [])
+        for name, unsafe, safe in cases:
             out = [name]
             for sql in (unsafe, safe):
                 if sql is None:

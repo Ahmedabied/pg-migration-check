@@ -116,8 +116,8 @@ def _norm(sql: str) -> str:
     return re.sub(r"\s+", " ", sql).strip().upper()
 
 
-def text_rules(sql: str) -> list[Finding]:
-    """Risks the lock view cannot show."""
+def text_rules(sql: str, server_version: int = 0) -> list[Finding]:
+    """Risks the lock view cannot show. server_version as psycopg gives it (180001 for 18.1); 0 if unknown."""
     s = _norm(sql)
     f = []
     if re.search(r"\bRENAME\s+COLUMN\b|\bALTER\s+TABLE\b.*\bRENAME\s+(?!CONSTRAINT)\b(TO\b|\w+\s+TO\b)", s):
@@ -127,8 +127,14 @@ def text_rules(sql: str) -> list[Finding]:
         f.append(Finding("warn", "drop column: deploy code that no longer reads or writes it first "
                                  "(Django: remove the field from the model in an earlier release)."))
     if re.search(r"\bSET\s+NOT\s+NULL\b", s):
-        f.append(Finding("warn", "SET NOT NULL scans the whole table under ACCESS EXCLUSIVE unless a valid "
-                                 "CHECK (col IS NOT NULL) exists. Add that check NOT VALID, VALIDATE it, then SET NOT NULL."))
+        f.append(Finding("warn", "SET NOT NULL scans the whole table under ACCESS EXCLUSIVE. On Postgres 18, add it as "
+                                 "a constraint instead: ADD CONSTRAINT name NOT NULL col NOT VALID, then VALIDATE "
+                                 "CONSTRAINT in a later step (that only blocks schema changes)." if server_version >= 180000
+                         else "SET NOT NULL scans the whole table under ACCESS EXCLUSIVE unless a valid "
+                              "CHECK (col IS NOT NULL) exists. Add that check NOT VALID, VALIDATE it, then SET NOT NULL."))
+    if re.search(r"\bADD\s+(CONSTRAINT\s+\S+\s+)?NOT\s+NULL\b", s) and "NOT VALID" not in s:
+        f.append(Finding("warn", "a new NOT NULL constraint is checked against every row under ACCESS EXCLUSIVE, so "
+                                 "reads wait too. Add it NOT VALID, then VALIDATE CONSTRAINT in a later step."))
     if re.search(r"\bADD\s+(CONSTRAINT\s+\S+\s+)?(FOREIGN\s+KEY|CHECK)\b", s) and "NOT VALID" not in s:
         f.append(Finding("warn", "a new FOREIGN KEY or CHECK is checked against every row while writes wait. "
                                  "Add it NOT VALID, then VALIDATE CONSTRAINT in a later step (that only blocks schema changes)."))
@@ -182,19 +188,29 @@ def concurrent_locks(conn, stmt: str) -> dict[str, str]:
     return {"?": sue}
 
 
-def _has_valid_not_null_check(conn, stmt: str) -> bool:
-    """Postgres 12+ skips the SET NOT NULL scan when a validated CHECK (col IS NOT NULL) exists."""
+def _set_not_null_skips_scan(conn, stmt: str) -> bool:
+    """SET NOT NULL reads no rows when the column is NOT NULL already, or (Postgres 12+) when a validated
+    CHECK (col IS NOT NULL) exists. On Postgres 18 attnotnull is also true under a NOT VALID not-null constraint,
+    which SET NOT NULL then validates by reading every row, so that case still counts as a scan."""
     m = re.match(r'\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?("?[\w.]+"?)\s+ALTER\s+(?:COLUMN\s+)?("?\w+"?)\s+SET\s+NOT\s+NULL',
                  stmt, re.I)
     if not m:
         return False
-    table, col = m.group(1), m.group(2).strip('"')
+    table, col = m.group(1), m.group(2)
+    col = col.strip('"') if col.startswith('"') else col.lower()  # unquoted names are folded to lower case
     try:
         with conn.transaction():  # a savepoint under --rollback: a failed lookup must not end the run's transaction
             row = conn.execute(
                 "select count(*) from pg_constraint where conrelid = to_regclass(%s) and contype = 'c' and convalidated "
                 "and regexp_replace(pg_get_constraintdef(oid), '[()\"]', '', 'g') ilike %s",
                 (table, f"CHECK {col} IS NOT NULL")).fetchone()
+            if row and row[0]:
+                return True
+            row = conn.execute(
+                "select a.attnotnull and not exists (select from pg_constraint c where c.conrelid = a.attrelid "
+                "and c.contype = 'n' and c.conkey = array[a.attnum] and not c.convalidated) "
+                "from pg_attribute a where a.attrelid = to_regclass(%s) and a.attname = %s and not a.attisdropped",
+                (table, col)).fetchone()
         return bool(row and row[0])
     except Exception:
         return False
@@ -244,10 +260,10 @@ def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> li
     results: list[Result] = []
     live = {row[1] for row in conn.execute(SNAPSHOT).fetchall()}  # tables that exist before the file: live traffic
     for n, stmt in enumerate(stmts, 1):
-        r = Result(n, stmt, findings=text_rules(stmt))
+        r = Result(n, stmt, findings=text_rules(stmt, conn.info.server_version))
         s = _norm(stmt)
         m = re.match(r'ALTER TABLE (?:ONLY )?(?:IF EXISTS )?("?[\w.]+"?) ALTER (?:COLUMN )?("?\w+"?) SET NOT NULL$', s)
-        if m and _has_valid_not_null_check(conn, stmt):
+        if m and _set_not_null_skips_scan(conn, stmt):
             r.findings = [f for f in r.findings if not f.text.startswith("SET NOT NULL")]
         r.concurrently = is_concurrent(stmt)
         try:

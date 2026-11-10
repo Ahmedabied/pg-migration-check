@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 from pg_migration_check.check import check, held_until_commit, split, text_rules
 
 
@@ -147,6 +149,44 @@ def test_set_not_null_after_a_validated_check_is_not_flagged(conn):
     assert last.error is None and not [f for f in last.findings if f.level != "info"]
     plain = [x for x in check(conn, "set lock_timeout = '2s'; alter table orders alter column qty set not null") if x.n == 2][0]
     assert any(f.text.startswith("SET NOT NULL") for f in plain.findings)
+
+
+def test_not_null_rules_know_postgres_18():
+    warn = lambda sql, v=0: [f.text for f in text_rules(sql, v) if f.level == "warn"]  # noqa: E731
+    assert any("NOT NULL constraint" in w for w in warn("alter table orders add constraint q_nn not null qty"))
+    assert any("NOT NULL constraint" in w for w in warn("ALTER TABLE orders ADD NOT NULL qty"))
+    assert warn("alter table orders add constraint q_nn not null qty not valid") == []
+    assert warn("alter table orders add column z int not null default 0") == []
+    assert "CHECK (col IS NOT NULL)" in warn("alter table orders alter column qty set not null", 170004)[0]
+    assert "NOT NULL col NOT VALID" in warn("alter table orders alter column qty set not null", 180001)[0]
+
+
+def test_set_not_null_on_a_column_that_is_not_null_already_is_not_flagged(conn):
+    conn.execute('alter table orders add column "Note" text not null default \'\'')
+    for sql in ["alter table orders alter column id set not null", 'alter table orders alter column "Note" set not null']:
+        res = [x for x in check(conn, "set lock_timeout = '2s';" + sql) if x.n == 2][0]
+        assert res.error is None and not [f for f in res.findings if f.text.startswith("SET NOT NULL")], sql
+
+
+def test_postgres_18_not_null_not_valid(conn):
+    if conn.info.server_version < 180000:
+        pytest.skip("NOT NULL ... NOT VALID is new in Postgres 18")
+    conn.execute("insert into orders (email, qty) values (null, 1)")  # NOT VALID leaves an old NULL alone
+    res = check(conn, "set lock_timeout = '2s';"
+                      "alter table orders add constraint q_nn not null qty not valid;"
+                      "alter table orders validate constraint q_nn")
+    assert [x.error for x in res] == [None, None, None]
+    assert [f.text for x in res for f in x.findings if f.level != "info"] == []
+    assert res[2].locks == {"public.orders": "ShareUpdateExclusiveLock"}
+    conn.execute("alter table orders add constraint e_nn not null email not valid")  # attnotnull is now true
+    later = [x for x in check(conn, "set lock_timeout = '2s'; alter table orders alter column email set not null")
+             if x.n == 2][0]
+    assert "contains null values" in (later.error or "")  # it read the rows: still flagged
+    assert any("NOT NULL col NOT VALID" in f.text for f in later.findings)
+    plain = [x for x in check(conn, "set lock_timeout = '2s'; alter table orders add constraint c_nn not null created_at")
+             if x.n == 2][0]
+    assert plain.locks == {"public.orders": "AccessExclusiveLock"}
+    assert any("NOT NULL constraint" in f.text for f in plain.findings)
 
 
 def test_concurrent_shapes():

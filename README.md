@@ -35,7 +35,8 @@ savepoint of one transaction with `--rollback`), and before it commits the tool 
 - **how long it took**, which is how long those locks were held, on the rows you put in the scratch database.
 
 A few risks the locks cannot show are read from the SQL: renames and dropped columns (they break code that is still
-running), `SET NOT NULL` without a validated `CHECK`, constraints added without `NOT VALID`, and no `lock_timeout`.
+running), `SET NOT NULL` without a validated `CHECK` (on Postgres 18 it suggests a `NOT NULL` constraint added
+`NOT VALID` instead), constraints added without `NOT VALID` (`NOT NULL` ones too), and no `lock_timeout`.
 Tables created earlier in the same file are skipped: nothing live uses them yet (with `--rollback`, only until
 the file has locked a live table; after that the SQL rules still speak about the new tables too).
 
@@ -53,6 +54,11 @@ the file has locked a live table; after that the SQL rules still speak about the
 
 The safe versions do the same work, often a little more of it, while live traffic keeps going. Lock time grows
 with the table: a 50M row table is roughly 50 times these numbers.
+
+Postgres 18 has a shorter way to make a column NOT NULL: `ADD CONSTRAINT name NOT NULL col NOT VALID`, then
+`VALIDATE CONSTRAINT`. On 18.6, same machine and table, that blocked for 0.1 ms (whole step 38 ms) against 41 ms
+for `SET NOT NULL`, and leaves no `CHECK` behind to drop. pg-migration-check suggests it when the server is 18 or
+newer, and flags a `NOT NULL` constraint added without `NOT VALID`, which reads every row under ACCESS EXCLUSIVE.
 
 ## Run it in under a minute
 
@@ -133,7 +139,8 @@ will meet in production, with Django's own SQL (what `sqlmigrate` prints). The o
 already applied are applied silently; the rest are reported statement by statement, with the lock time a Django
 migration really has: one transaction, so every lock is held until the last statement commits (unless the migration
 says `atomic = False`). It exits 1 on a danger, like the command line tool. The scratch database must be empty.
-CI tests it with Django 6.1 on Postgres 16 and 17, and Django 5.2 on Postgres 14 (Django 6 needs Postgres 15).
+CI tests it with Django 6.1 on Postgres 16, 17 and 18, and Django 5.2 on Postgres 14 (Django 6 needs Postgres 15)
+and on Python 3.10 (Django 6 needs 3.12).
 
 Run on every migration of Django's own contrib apps (admin, auth, contenttypes, sessions, sites, flatpages,
 redirects; Django 6.1.3): 23 migrations, 63 statements, checked in 0.14 s. No dangers on these empty tables, and 20
@@ -189,7 +196,7 @@ its address as a secret and set `rollback: "true"`. Other inputs: `rows`, `fail-
 matches, the step passes and says so. The action installs the version of the checker it is pinned to, in its own
 virtualenv, and passes the inputs through environment variables, so a file name cannot run a command.
 
-This repository's own CI runs the tests and both examples on Postgres 14, 16 and 17, and runs the action itself
+This repository's own CI runs the tests and both examples on Postgres 14, 16, 17 and 18, and runs the action itself
 on both examples with `rollback`.
 
 ## Limits
@@ -212,7 +219,7 @@ on both examples with `rollback`.
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 53 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 2 s
+pytest -q            # 56 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 11 s
 ```
 
 Built with AI pair programming.

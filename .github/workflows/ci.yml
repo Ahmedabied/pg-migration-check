@@ -8,8 +8,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        postgres: ["14", "16", "17"]
+        postgres: ["14", "16", "17", "18"]
+        python: ["3.12"]
+        include:
+          - postgres: "18"
+            python: "3.10"
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -24,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - run: pip install -e '.[test]'
       - name: Django 6 needs Postgres 15 or newer; test Postgres 14 with Django 5.2 LTS
         if: matrix.postgres == '14'
@@ -38,7 +43,12 @@ jobs:
           pg-migration-check examples/0002_unsafe.sql --dsn postgresql://postgres:ci@localhost:5432/demo; code=$?
           set -e
           test $code -eq 1
-          pg-migration-check examples/0003_safe.sql --dsn postgresql://postgres:ci@localhost:5432/demo
+      - name: the safe version passes (on a fresh copy, as both start from the same schema)
+        run: |
+          # On Postgres 18 the unsafe run's SET NOT NULL leaves a constraint named orders_email_not_null behind
+          psql "$PGMC_TEST_DSN" -c "create database demo_safe"
+          psql "postgresql://postgres:ci@localhost:5432/demo_safe" -f examples/schema.sql
+          pg-migration-check examples/0003_safe.sql --dsn postgresql://postgres:ci@localhost:5432/demo_safe
       - name: --rollback leaves a 100k row table exactly as it was
         run: python bench/rollback.py --rows 100000 --dsn "$PGMC_TEST_DSN"
       - name: a fresh copy of the example schema for the action
