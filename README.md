@@ -185,7 +185,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: psql "$DSN" -f schema.sql      # your schema and some rows: lock time depends on them
-      - uses: Ahmedabied/pg-migration-check@v0.2.0
+      - uses: Ahmedabied/pg-migration-check@v0.3.0
         with:
           files: migrations/new/*.sql
           dsn: ${{ env.DSN }}
