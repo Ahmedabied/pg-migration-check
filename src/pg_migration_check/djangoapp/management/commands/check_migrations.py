@@ -85,7 +85,7 @@ class Command(BaseCommand):
                     if fresh:
                         self.stdout.write(f"\nBefore {migration.app_label}.{migration.name}:\n")
                         seed_report(fresh, self.stdout)
-                results = check(conn, sql, o["slow_ms"])
+                results = check(conn, sql, o["slow_ms"], one_transaction=migration.atomic)
                 failed = next((r for r in results if r.error), None)
                 if shown:
                     reported += 1
@@ -117,7 +117,7 @@ class Command(BaseCommand):
                     for migration in pending:
                         sql = "\n".join(collect_sql([(migration, False)]))
                         try:
-                            results = check(conn, sql, o["slow_ms"], rollback=True)
+                            results = check(conn, sql, o["slow_ms"], rollback=True, one_transaction=migration.atomic)
                         except ValueError as e:
                             raise CommandError(f"{migration.app_label}.{migration.name}: {e}")
                         failed = next((r for r in results if r.error), None)

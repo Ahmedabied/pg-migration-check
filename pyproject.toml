@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pg-migration-check"
-version = "0.4.0"
+version = "0.4.1"
 description = "Apply a Postgres migration to a scratch database and report the locks, rewrites and lock time of each statement."
 readme = "README.md"
 license = "MIT"

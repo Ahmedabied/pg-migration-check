@@ -185,3 +185,19 @@ def test_a_table_renamed_earlier_in_the_file_is_still_live(server_uri, template)
     index, vacuum = results[2], results[3]
     assert any(f.text.startswith("CREATE INDEX without CONCURRENTLY") for f in index.findings), index.findings
     assert vacuum.rewritten == ["public.purchases"] and vacuum.findings[0].level == "danger", vacuum.findings
+
+
+def test_concurrently_in_a_file_that_runs_as_one_transaction_is_a_danger(server_uri, template):
+    sql = "create index concurrently orders_created_idx on orders (created_at)"
+    for one, want in ((True, True), (False, False)):
+        name = "case_" + uuid.uuid4().hex[:8]
+        with psycopg.connect(server_uri, autocommit=True) as c:
+            c.execute(f"create database {name} template {template}")
+        try:
+            with psycopg.connect(psycopg.conninfo.make_conninfo(server_uri, dbname=name)) as conn:
+                results = check(conn, "set lock_timeout = '2s'; " + sql, one_transaction=one)
+        finally:
+            with psycopg.connect(server_uri, autocommit=True) as c:
+                c.execute(f"drop database {name} with (force)")
+        dangers = [f.text for r in results for f in r.findings if f.level == "danger"]
+        assert bool(dangers) is want and all(t.startswith("Postgres refuses this inside a transaction") for t in dangers)

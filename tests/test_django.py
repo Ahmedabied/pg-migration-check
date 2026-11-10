@@ -97,9 +97,14 @@ def copy_state(c) -> tuple:
             q("select count(*), md5(string_agg(o::text, ',' order by id)) from shop_order o"))
 
 
-def test_rollback_checks_a_copy_of_production_and_leaves_it_as_it_was(project, server_uri):
+def test_rollback_checks_a_copy_of_production_and_leaves_it_as_it_was(project, server_uri, monkeypatch):
     from django.core.management import call_command
     from django.db import connections
+
+    from pg_migration_check.djangoapp.management.commands import check_migrations as command
+
+    atomic, real = [], command.check
+    monkeypatch.setattr(command, "check", lambda *a, **k: atomic.append(k.get("one_transaction")) or real(*a, **k))
 
     call_command("migrate", "shop", "0001", verbosity=0)
     call_command("migrate", "auth", verbosity=0)
@@ -120,6 +125,7 @@ def test_rollback_checks_a_copy_of_production_and_leaves_it_as_it_was(project, s
         assert "shop.0002_widen_qty_and_index" in out and "shop.0003_note" in out and "shop.0001_initial" not in out
         assert "rewrites public.shop_order" in out and "public.shop_order (30,000 rows)" in out
         assert "2 migrations checked (not yet applied to the copy). Rolled back" in out
+        assert atomic == [True, True]  # both pending migrations are atomic, and the command says so
         with psycopg.connect(copy, autocommit=True) as c:
             assert copy_state(c) == before
     finally:
@@ -136,3 +142,21 @@ def test_rollback_needs_a_migrated_copy_and_does_not_fill_tables(project, dsn):
         run("--rollback", "--dsn", dsn)
     with pytest.raises(CommandError, match="do not apply"):
         run("--rollback", "--rows", "10", "--dsn", dsn)
+
+
+def test_an_atomic_migration_is_checked_as_one_transaction(project, dsn, monkeypatch):
+    # collect_sql gives a migration's SQL without the BEGIN and COMMIT that sqlmigrate prints, so the command says
+    # which migrations run in one transaction: a RunSQL with CONCURRENTLY in an atomic one fails at deploy.
+    from pg_migration_check.djangoapp.management.commands import check_migrations as command
+
+    seen = {}
+    real = command.check
+
+    def spy(conn, sql, *args, **kwargs):
+        seen[sql] = kwargs.get("one_transaction")
+        return real(conn, sql, *args, **kwargs)
+
+    monkeypatch.setattr(command, "check", spy)
+    run("--dsn", dsn, "--all", "shop")
+    # every call says it (a bool, never left out), and the atomic migrations (all of shop's) say True
+    assert seen and all(isinstance(v, bool) for v in seen.values()) and True in seen.values(), seen

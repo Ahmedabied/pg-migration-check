@@ -165,7 +165,9 @@ It builds the scratch database from nothing by applying every migration in order
 will meet in production, with Django's own SQL (what `sqlmigrate` prints). The ones your `default` database has
 already applied are applied silently; the rest are reported statement by statement, with the lock time a Django
 migration really has: one transaction, so every lock is held until the last statement commits (unless the migration
-says `atomic = False`). It exits 1 on a danger, like the command line tool. The scratch database must be empty.
+says `atomic = False`). For the same reason a `RunSQL` with `CONCURRENTLY` (or `VACUUM`) in an atomic migration is
+a danger: Postgres refuses it inside the transaction, so the deploy would fail there. It exits 1 on a danger, like
+the command line tool. The scratch database must be empty.
 CI tests it with Django 6.1 on Postgres 16, 17 and 18, and Django 5.2 on Postgres 14 (Django 6 needs Postgres 15)
 and on Python 3.10 (Django 6 needs 3.12).
 
@@ -212,7 +214,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: psql "$DSN" -f schema.sql      # your schema and some rows: lock time depends on them
-      - uses: Ahmedabied/pg-migration-check@v0.4.0
+      - uses: Ahmedabied/pg-migration-check@v0.4.1
         with:
           files: migrations/new/*.sql
           dsn: ${{ env.DSN }}
@@ -255,7 +257,7 @@ on both examples with `rollback`.
 
 ```sh
 pip install -e '.[test,local]'
-pytest -q            # 99 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
+pytest -q            # 101 tests on a real Postgres (pgserver locally, $PGMC_TEST_DSN in CI), about 16 s
 ```
 
 Built with AI pair programming.

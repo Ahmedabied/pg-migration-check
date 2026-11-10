@@ -294,14 +294,17 @@ def _execute(conn, stmt: str) -> int:
     return conn.execute(stmt, prepare=False, binary=True).rowcount
 
 
-def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False) -> list[Result]:
+def check(conn, sql: str, slow_ms: float = 1000.0, rollback: bool = False, one_transaction: bool = False) -> list[Result]:
     """Apply `sql` to the database behind `conn` (a psycopg connection to a scratch database), one statement per
     transaction, and return what each statement did. Stops at the first error, like a migration would.
 
     rollback=True: the caller has opened one transaction and rolls it back afterwards (cli --rollback). Each statement
     runs in a savepoint inside it and shows the locks it added; a lock an earlier statement took is still held and is
-    not shown again. A CONCURRENTLY statement cannot run in a transaction, so its plain form is run to time it."""
-    stmts, in_block, block = [], [], False
+    not shown again. A CONCURRENTLY statement cannot run in a transaction, so its plain form is run to time it.
+
+    one_transaction=True: the file runs in one transaction in production, as an atomic Django migration does (its
+    SQL from collect_sql has no BEGIN and COMMIT around it), so a statement Postgres refuses there is a danger."""
+    stmts, in_block, block = [], [], one_transaction
     for s in split(sql):
         if WRAPPER.fullmatch(_norm(s)):  # BEGIN ... COMMIT around the file: Django's sqlmigrate writes it
             block = _norm(s).startswith(("BEGIN", "START"))
